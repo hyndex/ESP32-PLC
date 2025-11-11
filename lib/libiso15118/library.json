@@ -1,0 +1,10 @@
+{
+  "name": "libiso15118-embedded",
+  "version": "0.1.0",
+  "build": {
+    "srcFilter": [
+      "+<*.cpp>",
+      "+<src/*.cpp>"
+    ]
+  }
+}

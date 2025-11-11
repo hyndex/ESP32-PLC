@@ -12,10 +12,10 @@ This backlog translates the high-level integration plan into concrete, traceable
 | EXI-02 | Migrate DIN EXI | Replace `projectExiConnector` usage with libcbv2g types in the DIN FSM. | Firmware | ☑ |
 | TLS-01 | esp-tls integration | Add TLS server (15118) using esp-tls (MbedTLS) with placeholder certificates; handshake loopback test. | Firmware/Sec | ☑ |
 | TLS-02 | SDP security matrix | Respond to SDP Security=0x00/0x10 with appropriate endpoints; route TLS requests to TLS server. | Firmware | ☑ |
-| HLC-01 | Complete DIN DC states | Implement CableCheck → SessionStop using existing power HAL (cp_control/dc_can). | Firmware | ☐ |
-| HLC-02 | Integrate ISO-2 over TLS | Extend HLC to handle ISO15118-2 semantics (PnC/TLS) using libcbv2g. *(Initial SAP/SessionSetup/ServiceDiscovery/PaymentServiceSelection scaffolding merged; remaining execution states pending.)* | Firmware | ☐ |
-| HLC-03 | Integrate ISO-20 | Pull libiso15118, wire TLS1.3 connections, and map callbacks to EVSE HAL. | Firmware | ☐ |
+| HLC-01 | Complete DIN DC states | Implement CableCheck → SessionStop using existing power HAL (cp_control/dc_can). | Firmware | ☑ |
+| HLC-02 | Integrate ISO-2 over TLS | Extend HLC to handle ISO15118-2 semantics (PnC/TLS) using libcbv2g. *(PaymentDetails → SessionStop now implemented; TLS transport already in place via esp-tls.)* | Firmware | ☑ |
+| HLC-03 | Integrate ISO-20 | Embed libiso15118 on ESP32 (`lib/libiso15118/` port + `src/iso15118_dc.cpp` wiring), feed callbacks from cp_control/dc_can, and keep ISO‑20 loop active via ControlEvent start/stop. *(TLS 1.3 hooks still TBD, but controller + cert drop are in place.)* | Firmware | ⚙ |
 | HAL-01 | Power HAL contract | Define/implement a consolidated EVSE power HAL consumed by DIN/ISO FSMs (contactors, DC setpoints, isolation). | Firmware/HW | ☐ |
-| PKI-01 | Certificate storage | Define storage + APIs for EVSE certificate/key + root CAs (NVS/secure element). | Security | ☑ |
+| PKI-01 | Certificate storage | Define storage + APIs for EVSE certificate/key + root CAs (NVS/secure element) plus CLI/JSON provisioning with diagnostic auth tokens. | Security | ☑ |
 
 _Legend_: ☐ = pending, ☑ = complete.

@@ -31,10 +31,12 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <ArduinoJson.h>
 #include <vector>
 #include <string>
 #include <mbedtls/base64.h>
 #include <ctype.h>
+#include <string.h>
 
 #if __has_include("freertos/FreeRTOS.h")
 #include "freertos/FreeRTOS.h"
@@ -42,6 +44,7 @@
 #endif
 
 #include "main.h"
+#include "evse_config.h"
 #include "ipv6.h"
 #include "tcp.h"
 #include "cp_control.h"
@@ -52,6 +55,7 @@
 #include "pki_store.h"
 #include "tls_server.h"
 #include "tls_credentials.h"
+#include "iso15118_dc.h"
 
 
 uint8_t txbuffer[3164], rxbuffer[3164];
@@ -76,8 +80,13 @@ uint8_t EVSOC = 0;  // State Of Charge of the EV, obtained from the 'ContractAut
 
 static void cli_poll(void);
 static void cli_process_line(const String &line);
+static bool cli_process_json(const String &line);
 static bool cli_decode_base64(const String &src, std::string &out);
 static bool cli_encode_base64(const std::string &src, std::string &out);
+static bool diag_auth_is_valid(void);
+static bool diag_auth_attempt(const String &token);
+static void diag_auth_revoke(void);
+static bool diag_auth_required(void);
 
 const uint8_t MAX_SUPPORTED_SOUND_COUNT = 20;
 const uint8_t SLAC_MAX_RETRIES = 3;
@@ -726,6 +735,35 @@ void Timer20ms(void * parameter) {
 
 
 static String g_cli_buffer;
+static uint32_t g_diag_auth_until_ms = 0;
+
+static bool diag_auth_token_required() {
+    return (strlen(DIAG_AUTH_TOKEN) > 0);
+}
+
+static bool diag_auth_is_valid(void) {
+    if (!diag_auth_token_required()) return true;
+    if (g_diag_auth_until_ms == 0) return false;
+    return (int32_t)(millis() - (int32_t)g_diag_auth_until_ms) <= 0;
+}
+
+static bool diag_auth_attempt(const String &token) {
+    if (!diag_auth_token_required()) return true;
+    if (!token.length()) return false;
+    if (token.equals(DIAG_AUTH_TOKEN)) {
+        g_diag_auth_until_ms = millis() + DIAG_AUTH_WINDOW_MS;
+        return true;
+    }
+    return false;
+}
+
+static void diag_auth_revoke(void) {
+    g_diag_auth_until_ms = 0;
+}
+
+static bool diag_auth_required(void) {
+    return diag_auth_token_required();
+}
 
 static void split_tokens(const String &line, std::vector<String> &tokens) {
     int idx = 0;
@@ -765,12 +803,169 @@ static bool cli_encode_base64(const std::string &src, std::string &out) {
     return true;
 }
 
+static bool cli_process_json(const String &line) {
+    StaticJsonDocument<768> doc;
+    DeserializationError err = deserializeJson(doc, line);
+    if (err) {
+        return false;
+    }
+    const char *type = doc["type"] | "";
+    if (!strcmp(type, "diag")) {
+        const char *op = doc["op"] | "";
+        StaticJsonDocument<256> res;
+        res["type"] = "diag.res";
+        res["op"] = op;
+        auto emit = [&]() {
+            serializeJson(res, Serial);
+            Serial.print('\n');
+        };
+        if (!strcmp(op, "auth")) {
+            const char *token = doc["token"] | "";
+            if (diag_auth_attempt(String(token))) {
+                res["ok"] = true;
+                emit();
+            } else {
+                res["ok"] = false;
+                res["error"] = "auth_failed";
+                emit();
+            }
+            return true;
+        }
+        res["ok"] = false;
+        res["error"] = "unknown_op";
+        emit();
+        return true;
+    }
+    if (strcmp(type, "pki") != 0) {
+        return false;
+    }
+    if (diag_auth_required()) {
+        const char *token = doc["auth_token"] | "";
+        if (!diag_auth_attempt(String(token))) {
+            StaticJsonDocument<256> res;
+            res["type"] = "pki.res";
+            res["ok"] = false;
+            res["error"] = "auth_required";
+            serializeJson(res, Serial);
+            Serial.print('\n');
+            return true;
+        }
+    }
+    const char *op = doc["op"] | "";
+    const char *target = doc["target"] | "";
+    StaticJsonDocument<768> res;
+    res["type"] = "pki.res";
+    res["op"] = op;
+    res["target"] = target;
+    auto emit = [&]() {
+        serializeJson(res, Serial);
+        Serial.print('\n');
+    };
+    if (!op[0] || !target[0]) {
+        res["ok"] = false;
+        res["error"] = "invalid_params";
+        emit();
+        return true;
+    }
+    String targetStr(target);
+    if (!strcmp(op, "set")) {
+        const char *payload = doc["data_b64"] | "";
+        if (!payload[0]) {
+            res["ok"] = false;
+            res["error"] = "missing_data";
+            emit();
+            return true;
+        }
+        std::string decoded;
+        if (!cli_decode_base64(String(payload), decoded)) {
+            res["ok"] = false;
+            res["error"] = "bad_base64";
+            emit();
+            return true;
+        }
+        bool ok = false;
+        if (targetStr.equalsIgnoreCase("cert")) ok = pki_store_set_server_cert(decoded);
+        else if (targetStr.equalsIgnoreCase("key")) ok = pki_store_set_server_key(decoded);
+        else if (targetStr.equalsIgnoreCase("ca")) ok = pki_store_set_root_ca(decoded);
+        else {
+            res["ok"] = false;
+            res["error"] = "unknown_target";
+            emit();
+            return true;
+        }
+        if (ok) {
+            tls_credentials_reload();
+            res["ok"] = true;
+            res["bytes"] = static_cast<uint32_t>(decoded.size());
+        } else {
+            res["ok"] = false;
+            res["error"] = "store_failed";
+        }
+        emit();
+        return true;
+    }
+    if (!strcmp(op, "get")) {
+        std::string value;
+        bool ok = false;
+        if (targetStr.equalsIgnoreCase("cert")) ok = pki_store_get_server_cert(value);
+        else if (targetStr.equalsIgnoreCase("key")) ok = pki_store_get_server_key(value);
+        else if (targetStr.equalsIgnoreCase("ca")) ok = pki_store_get_root_ca(value);
+        else {
+            res["ok"] = false;
+            res["error"] = "unknown_target";
+            emit();
+            return true;
+        }
+        if (!ok) {
+            res["ok"] = false;
+            res["error"] = "no_data";
+            emit();
+            return true;
+        }
+        std::string encoded;
+        if (!cli_encode_base64(value, encoded)) {
+            res["ok"] = false;
+            res["error"] = "encode_failed";
+            emit();
+            return true;
+        }
+        res["ok"] = true;
+        res["data_b64"] = encoded.c_str();
+        emit();
+        return true;
+    }
+    res["ok"] = false;
+    res["error"] = "unknown_op";
+    emit();
+    return true;
+}
+
 static void cli_process_line(const String &line) {
     std::vector<String> tokens;
     split_tokens(line, tokens);
     if (tokens.empty()) return;
+    if (line.startsWith("{")) {
+        if (cli_process_json(line)) return;
+    }
+    if (tokens[0].equalsIgnoreCase("diag")) {
+        if (tokens.size() >= 3 && tokens[1].equalsIgnoreCase("auth")) {
+            if (diag_auth_attempt(tokens[2])) {
+                Serial.println("[DIAG] Auth accepted");
+            } else {
+                diag_auth_revoke();
+                Serial.println("[DIAG] Auth failed");
+            }
+        } else {
+            Serial.println("[DIAG] Usage: diag auth <token>");
+        }
+        return;
+    }
     if (!tokens[0].equalsIgnoreCase("pki")) {
         Serial.println("[CLI] Unknown command");
+        return;
+    }
+    if (diag_auth_required() && !diag_auth_is_valid()) {
+        Serial.println("[PKI] Authorization required (diag auth <token>)");
         return;
     }
     if (tokens.size() >= 4 && tokens[1].equalsIgnoreCase("set")) {
@@ -889,6 +1084,7 @@ void setup() {
     tcp_socket_server_start();
     tls_server_start();
 #endif
+    iso20_init();
 
     modem_state = MODEM_POWERUP;
    
@@ -903,6 +1099,7 @@ void loop() {
   //  Serial.printf("Free PSRAM: %u\n", ESP.getFreePsram());
 
     cli_poll();
+    iso20_loop();
     delay(1000);
 }
 

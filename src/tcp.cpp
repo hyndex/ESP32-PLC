@@ -1,12 +1,17 @@
 #include <Arduino.h>
 #include <math.h>
 #include <cstring>
+#include <algorithm>
 #include "main.h"
 #include "ipv6.h"
 #include "tcp.h"
 #include "cp_control.h"
 #include "dc_can.h"
 #include "evse_config.h"
+#ifdef ESP_PLATFORM
+#include "esp_system.h"
+#include "esp_timer.h"
+#endif
 
 extern "C" {
 #include "cbv2g/app_handshake/appHand_Datatypes.h"
@@ -155,11 +160,26 @@ using dinCurrentDemandReqType = din_CurrentDemandReqType;
 #define init_iso2ServiceDiscoveryResType init_iso2_ServiceDiscoveryResType
 #define init_iso2PaymentServiceSelectionResType init_iso2_PaymentServiceSelectionResType
 #define init_iso2DC_EVSEStatusType init_iso2_DC_EVSEStatusType
+#define init_iso2PaymentDetailsResType init_iso2_PaymentDetailsResType
+#define init_iso2AuthorizationResType init_iso2_AuthorizationResType
+#define init_iso2ChargeParameterDiscoveryResType init_iso2_ChargeParameterDiscoveryResType
+#define init_iso2CableCheckResType init_iso2_CableCheckResType
+#define init_iso2PreChargeResType init_iso2_PreChargeResType
+#define init_iso2PowerDeliveryResType init_iso2_PowerDeliveryResType
+#define init_iso2CurrentDemandResType init_iso2_CurrentDemandResType
+#define init_iso2MeteringReceiptResType init_iso2_MeteringReceiptResType
+#define init_iso2SessionStopResType init_iso2_SessionStopResType
+#define init_iso2DC_EVSEChargeParameterType init_iso2_DC_EVSEChargeParameterType
+#define init_iso2PhysicalValueType init_iso2_PhysicalValueType
 
 typedef void (*socket_send_cb_t)(const uint8_t *data, uint16_t len);
 
 static socket_send_cb_t g_socketSendCb = nullptr;
 static HlcProtocol g_hlc_protocol = HlcProtocol::Din;
+static bool g_iso_expect_payment_details = false;
+static bool g_iso_payment_details_done = false;
+static constexpr uint8_t kDefaultSasTupleId = 1;
+static iso2_paymentOptionType g_iso_selected_payment_option = iso2_paymentOptionType_ExternalPayment;
 
 void tcp_register_socket_sender(socket_send_cb_t cb) {
     g_socketSendCb = cb;
@@ -173,16 +193,32 @@ static void setPhysicalValue(dinPhysicalValueType *value, dinunitSymbolType unit
 static void populateDcEvseStatus(dinDC_EVSEStatusType *status, dinDC_EVSEStatusCodeType code);
 static void populateAcEvseStatus(dinAC_EVSEStatusType *status);
 static bool handleMeteringReceipt(void);
+static void iso_set_physical_value(iso2_PhysicalValueType *value, iso2_unitSymbolType unit, float magnitude);
+static float iso_decode_physical_value(const iso2_PhysicalValueType &value);
+static void iso_populate_dc_evse_status(iso2_DC_EVSEStatusType *status, iso2_DC_EVSEStatusCodeType code);
+static iso2_DC_EVSEStatusCodeType iso_current_evse_status_code(void);
+static void iso_set_evse_id(char *buffer, uint16_t &len, size_t maxLen);
+static bool handle_iso_metering_receipt(void);
+static void stop_evse_power_output(void);
+static void iso_watchdog_start(uint8_t state);
+static void iso_watchdog_clear(void);
+static void iso_watchdog_check(void);
 static bool decode_iso2_message(void);
 static void prepare_iso2_message(void);
 static bool send_iso2_message(void);
 
 const int16_t EVSE_PRESENT_VOLTAGE = 400;
 const int16_t EVSE_PRESENT_CURRENT = 0;
-const int16_t EVSE_MAX_VOLTAGE = 500;
-const int16_t EVSE_MAX_CURRENT = 200;
-const int16_t EVSE_MAX_POWER_KW = 150; // expressed with multiplier to get W.
 bool chargingActive = false;
+static uint32_t g_iso_state_start_ms = 0;
+static uint8_t g_iso_state_watchdog = 0;
+static uint8_t g_iso_watchdog_retries = 0;
+#ifndef ISO_STATE_TIMEOUT_MS
+#define ISO_STATE_TIMEOUT_MS 4000UL
+#endif
+#ifndef ISO_STATE_WATCHDOG_MAX_RETRIES
+#define ISO_STATE_WATCHDOG_MAX_RETRIES 3
+#endif
 
 static float decodePhysicalValue(const dinPhysicalValueType &value) {
     float scale = powf(10.0f, (float)value.Multiplier);
@@ -250,6 +286,108 @@ static void populateAcEvseStatus(dinAC_EVSEStatusType *status) {
     status->RCD = 0;
     status->NotificationMaxDelay = 0;
     status->EVSENotification = dinEVSENotificationType_None;
+}
+
+static void iso_set_physical_value(iso2_PhysicalValueType *value, iso2_unitSymbolType unit, float magnitude) {
+    if (!value) return;
+    init_iso2PhysicalValueType(value);
+    value->Unit = unit;
+    value->Multiplier = -1;
+    value->Value = (int16_t)lroundf(magnitude * 10.0f);
+}
+
+static float iso_decode_physical_value(const iso2_PhysicalValueType &value) {
+    float scale = powf(10.0f, (float)value.Multiplier);
+    return (float)value.Value * scale;
+}
+
+static void iso_populate_dc_evse_status(iso2_DC_EVSEStatusType *status, iso2_DC_EVSEStatusCodeType code) {
+    if (!status) return;
+    init_iso2DC_EVSEStatusType(status);
+    status->NotificationMaxDelay = 0;
+    status->EVSENotification = iso2_EVSENotificationType_None;
+    status->EVSEStatusCode = code;
+    status->EVSEIsolationStatus = iso2_isolationLevelType_Valid;
+    status->EVSEIsolationStatus_isUsed = 1;
+}
+
+static iso2_DC_EVSEStatusCodeType iso_current_evse_status_code(void) {
+    if (!cp_is_connected()) return iso2_DC_EVSEStatusCodeType_EVSE_NotReady;
+    if (!cp_contactor_feedback()) return iso2_DC_EVSEStatusCodeType_EVSE_Shutdown;
+    return iso2_DC_EVSEStatusCodeType_EVSE_Ready;
+}
+
+static void iso_set_evse_id(char *buffer, uint16_t &len, size_t maxLen) {
+    if (!buffer || maxLen == 0) {
+        len = 0;
+        return;
+    }
+    const char *evseId = EVSE_ID;
+    size_t copyLen = strnlen(evseId, maxLen);
+    memcpy(buffer, evseId, copyLen);
+    len = copyLen;
+}
+
+static void stop_evse_power_output(void) {
+    chargingActive = false;
+    dc_set_targets(0.0f, 0.0f);
+    dc_enable_output(false);
+    cp_contactor_command(false);
+}
+
+static void iso_watchdog_start(uint8_t state) {
+    if (g_hlc_protocol != HlcProtocol::Iso2) return;
+    g_iso_state_watchdog = state;
+    g_iso_state_start_ms = millis();
+    g_iso_watchdog_retries = 0;
+}
+
+static void iso_watchdog_clear(void) {
+    g_iso_state_watchdog = 0;
+    g_iso_state_start_ms = 0;
+    g_iso_watchdog_retries = 0;
+}
+
+static void iso_watchdog_check(void) {
+    if (g_hlc_protocol != HlcProtocol::Iso2) return;
+    if (g_iso_state_watchdog == 0) return;
+    uint32_t now = millis();
+    if ((int32_t)(now - g_iso_state_start_ms) > (int32_t)ISO_STATE_TIMEOUT_MS) {
+        g_iso_watchdog_retries++;
+        Serial.printf("[ISO-2] State %u watchdog timeout (retry %u/%u)\n",
+                      g_iso_state_watchdog,
+                      g_iso_watchdog_retries,
+                      (unsigned)ISO_STATE_WATCHDOG_MAX_RETRIES);
+        resetHlcSession();
+        if (g_iso_watchdog_retries >= ISO_STATE_WATCHDOG_MAX_RETRIES) {
+            Serial.println("[ISO-2] Watchdog retries exhausted, forcing transport reset");
+            tcp_transport_reset();
+            g_iso_watchdog_retries = 0;
+        }
+    }
+}
+
+static iso2_responseCodeType iso_process_power_delivery(iso2_chargeProgressType progress,
+                                                        bool &contactorOk,
+                                                        uint8_t &nextState) {
+    contactorOk = true;
+    if (progress == iso2_chargeProgressType_Start) {
+        contactorOk = cp_contactor_command(true);
+        if (contactorOk) {
+            chargingActive = true;
+            dc_enable_output(true);
+        } else {
+            stop_evse_power_output();
+        }
+        nextState = contactorOk ? stateWaitForCurrentDemandRequest : stateWaitForSessionStopRequest;
+    } else if (progress == iso2_chargeProgressType_Stop) {
+        stop_evse_power_output();
+        nextState = stateWaitForSessionStopRequest;
+    } else { // Renegotiate
+        stop_evse_power_output();
+        nextState = stateWaitForChargeParameterDiscoveryRequest;
+    }
+    return contactorOk ? iso2_responseCodeType_OK : iso2_responseCodeType_FAILED_PowerDeliveryNotApplied;
 }
 
 static bool decode_iso2_message() {
@@ -373,9 +511,25 @@ static bool handleMeteringReceipt(void) {
     return true;
 }
 
+static bool handle_iso_metering_receipt(void) {
+    if (!iso2DocDec.V2G_Message.Body.MeteringReceiptReq_isUsed) {
+        return false;
+    }
+    prepare_iso2_message();
+    iso2DocEnc.V2G_Message.Body.MeteringReceiptRes_isUsed = 1;
+    init_iso2MeteringReceiptResType(&iso2DocEnc.V2G_Message.Body.MeteringReceiptRes);
+    auto &res = iso2DocEnc.V2G_Message.Body.MeteringReceiptRes;
+    res.ResponseCode = iso2_responseCodeType_OK;
+    res.AC_EVSEStatus_isUsed = 0;
+    res.DC_EVSEStatus_isUsed = 1;
+    iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
+    send_iso2_message();
+    return true;
+}
+
 void resetHlcSession(void) {
     fsmState = stateWaitForSupportedApplicationProtocolRequest;
-    chargingActive = false;
+    stop_evse_power_output();
     tcpAwaitingAck = false;
     lastTcpPayloadLen = 0;
     expectedTcpAckNr = 0;
@@ -383,6 +537,9 @@ void resetHlcSession(void) {
     tcp_rxdataLen = 0;
     tcpLastActivity = 0;
     g_hlc_protocol = HlcProtocol::Din;
+    g_iso_expect_payment_details = false;
+    g_iso_payment_details_done = false;
+    iso_watchdog_clear();
 }
 
 static void tcp_bufferPayload(const uint8_t *payload, uint16_t len, bool fromSocket) {
@@ -485,6 +642,7 @@ void tcp_tick(void) {
             resetHlcSession();
         }
     }
+    iso_watchdog_check();
 }
 
 
@@ -592,12 +750,14 @@ void decodeV2GTP(void) {
                         g_hlc_protocol = HlcProtocol::Din;
                         if (send_supported_app_protocol_response(SchemaID)) {
                             fsmState = stateWaitForSessionSetupRequest;
+                            iso_watchdog_start(stateWaitForSessionSetupRequest);
                         }
                     } else if (strstr((const char*)strNamespace, ":iso:15118:2") != NULL) {
                         Serial.printf("Detected ISO 15118-2\n");
                         g_hlc_protocol = HlcProtocol::Iso2;
                         if (send_supported_app_protocol_response(SchemaID)) {
                             fsmState = stateWaitForSessionSetupRequest;
+                            iso_watchdog_start(stateWaitForSessionSetupRequest);
                         }
                     }
                 }
@@ -626,6 +786,7 @@ void decodeV2GTP(void) {
                 iso2DocEnc.V2G_Message.Body.SessionSetupRes.EVSETimeStamp_isUsed = 0;
                 send_iso2_message();
                 fsmState = stateWaitForServiceDiscoveryRequest;
+                iso_watchdog_start(stateWaitForServiceDiscoveryRequest);
                 return;
             }
         }
@@ -699,6 +860,7 @@ void decodeV2GTP(void) {
                 }
                 send_iso2_message();
                 fsmState = stateWaitForServicePaymentSelectionRequest;
+                iso_watchdog_start(stateWaitForServicePaymentSelectionRequest);
                 return;
             }
         }
@@ -749,16 +911,25 @@ void decodeV2GTP(void) {
         if (g_hlc_protocol == HlcProtocol::Iso2) {
             if (iso2DocDec.V2G_Message.Body.PaymentServiceSelectionReq_isUsed) {
                 Serial.printf("ISO PaymentServiceSelectionReqest\n");
-                bool external = (iso2DocDec.V2G_Message.Body.PaymentServiceSelectionReq.SelectedPaymentOption ==
-                                 iso2_paymentOptionType_ExternalPayment);
+                auto selected = iso2DocDec.V2G_Message.Body.PaymentServiceSelectionReq.SelectedPaymentOption;
                 prepare_iso2_message();
                 iso2DocEnc.V2G_Message.Body.PaymentServiceSelectionRes_isUsed = 1;
                 init_iso2PaymentServiceSelectionResType(&iso2DocEnc.V2G_Message.Body.PaymentServiceSelectionRes);
+                bool supported = (selected == iso2_paymentOptionType_ExternalPayment ||
+                                  selected == iso2_paymentOptionType_Contract);
                 iso2DocEnc.V2G_Message.Body.PaymentServiceSelectionRes.ResponseCode =
-                    external ? iso2_responseCodeType_OK : iso2_responseCodeType_FAILED_ServiceSelectionInvalid;
+                    supported ? iso2_responseCodeType_OK : iso2_responseCodeType_FAILED_ServiceSelectionInvalid;
                 send_iso2_message();
-                Serial.println("[ISO-2] Payment selection handled; further ISO-2 states not yet implemented");
-                resetHlcSession();
+                if (!supported) {
+                    Serial.println("[ISO-2] Unsupported payment option, terminating session");
+                    resetHlcSession();
+                    return;
+                }
+                g_iso_selected_payment_option = selected;
+                g_iso_expect_payment_details = (selected == iso2_paymentOptionType_Contract);
+                g_iso_payment_details_done = !g_iso_expect_payment_details;
+                fsmState = stateWaitForContractAuthenticationRequest;
+                iso_watchdog_start(stateWaitForContractAuthenticationRequest);
                 return;
             }
         }
@@ -785,7 +956,57 @@ void decodeV2GTP(void) {
             }
         }
     } else if (fsmState == stateWaitForContractAuthenticationRequest) {
-                
+        if (g_hlc_protocol == HlcProtocol::Iso2) {
+            if (iso2DocDec.V2G_Message.Body.PaymentDetailsReq_isUsed) {
+                Serial.println("[ISO-2] PaymentDetailsReq");
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.PaymentDetailsRes_isUsed = 1;
+                init_iso2PaymentDetailsResType(&iso2DocEnc.V2G_Message.Body.PaymentDetailsRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.PaymentDetailsRes;
+                res.ResponseCode = iso2_responseCodeType_OK;
+                uint16_t challengeLen =
+                    (uint16_t)std::min<size_t>(iso2_genChallengeType_BYTES_SIZE, static_cast<size_t>(16));
+                res.GenChallenge.bytesLen = challengeLen;
+                for (uint16_t i = 0; i < challengeLen; ++i) {
+#ifdef ESP_PLATFORM
+                    uint32_t r = esp_random();
+#else
+                    uint32_t r = (uint32_t)random(0, 0x7FFFFFFF);
+#endif
+                    res.GenChallenge.bytes[i] = (uint8_t)(r & 0xFF);
+                }
+#ifdef ESP_PLATFORM
+                res.EVSETimeStamp = esp_timer_get_time() / 1000;
+#else
+                res.EVSETimeStamp = millis();
+#endif
+                send_iso2_message();
+                g_iso_payment_details_done = true;
+                g_iso_expect_payment_details = false;
+                return;
+            }
+            if (iso2DocDec.V2G_Message.Body.AuthorizationReq_isUsed) {
+                Serial.println("[ISO-2] AuthorizationReq");
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.AuthorizationRes_isUsed = 1;
+                init_iso2AuthorizationResType(&iso2DocEnc.V2G_Message.Body.AuthorizationRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.AuthorizationRes;
+                if (g_iso_expect_payment_details && !g_iso_payment_details_done) {
+                    res.ResponseCode = iso2_responseCodeType_FAILED_SequenceError;
+                    res.EVSEProcessing = iso2_EVSEProcessingType_Finished;
+                    send_iso2_message();
+                    Serial.println("[ISO-2] Authorization before PaymentDetails; sequence error");
+                    return;
+                }
+                res.ResponseCode = iso2_responseCodeType_OK;
+                res.EVSEProcessing = iso2_EVSEProcessingType_Finished;
+                send_iso2_message();
+                fsmState = stateWaitForChargeParameterDiscoveryRequest;
+                iso_watchdog_start(stateWaitForChargeParameterDiscoveryRequest);
+                return;
+            }
+        }
+
         // Check if we have received the correct message
         if (dinDocDec.V2G_Message.Body.ContractAuthenticationReq_isUsed) {
 
@@ -805,6 +1026,46 @@ void decodeV2GTP(void) {
         }    
 
     } else if (fsmState == stateWaitForChargeParameterDiscoveryRequest) {
+
+        if (g_hlc_protocol == HlcProtocol::Iso2) {
+            if (iso2DocDec.V2G_Message.Body.ChargeParameterDiscoveryReq_isUsed) {
+                Serial.println("[ISO-2] ChargeParameterDiscoveryReq");
+                if (iso2DocDec.V2G_Message.Body.ChargeParameterDiscoveryReq.DC_EVChargeParameter_isUsed) {
+                    EVSOC = iso2DocDec.V2G_Message.Body.ChargeParameterDiscoveryReq.DC_EVChargeParameter.DC_EVStatus.EVRESSSOC;
+                }
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.ChargeParameterDiscoveryRes_isUsed = 1;
+                init_iso2ChargeParameterDiscoveryResType(&iso2DocEnc.V2G_Message.Body.ChargeParameterDiscoveryRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.ChargeParameterDiscoveryRes;
+                res.ResponseCode = iso2_responseCodeType_OK;
+                res.EVSEProcessing = iso2_EVSEProcessingType_Finished;
+                res.SAScheduleList_isUsed = 0;
+                res.SASchedules_isUsed = 0;
+                res.AC_EVSEChargeParameter_isUsed = 0;
+                res.EVSEChargeParameter_isUsed = 0;
+                res.DC_EVSEChargeParameter_isUsed = 1;
+                init_iso2DC_EVSEChargeParameterType(&res.DC_EVSEChargeParameter);
+                iso_populate_dc_evse_status(&res.DC_EVSEChargeParameter.DC_EVSEStatus, iso_current_evse_status_code());
+                iso_set_physical_value(&res.DC_EVSEChargeParameter.EVSEMaximumVoltageLimit,
+                                       iso2_unitSymbolType_V, EVSE_MAX_VOLTAGE);
+                iso_set_physical_value(&res.DC_EVSEChargeParameter.EVSEMinimumVoltageLimit,
+                                       iso2_unitSymbolType_V, 0.0f);
+                iso_set_physical_value(&res.DC_EVSEChargeParameter.EVSEMaximumCurrentLimit,
+                                       iso2_unitSymbolType_A, EVSE_MAX_CURRENT);
+                iso_set_physical_value(&res.DC_EVSEChargeParameter.EVSEMinimumCurrentLimit,
+                                       iso2_unitSymbolType_A, 0.0f);
+                iso_set_physical_value(&res.DC_EVSEChargeParameter.EVSEMaximumPowerLimit,
+                                       iso2_unitSymbolType_W, EVSE_MAX_POWER_KW * 1000.0f);
+                iso_set_physical_value(&res.DC_EVSEChargeParameter.EVSEPeakCurrentRipple,
+                                       iso2_unitSymbolType_A, 2.0f);
+                res.DC_EVSEChargeParameter.EVSECurrentRegulationTolerance_isUsed = 0;
+                res.DC_EVSEChargeParameter.EVSEEnergyToBeDelivered_isUsed = 0;
+                send_iso2_message();
+                fsmState = stateWaitForCableCheckRequest;
+                iso_watchdog_start(stateWaitForCableCheckRequest);
+                return;
+            }
+        }
 
         // Check if we have received the correct message
         if (dinDocDec.V2G_Message.Body.ChargeParameterDiscoveryReq_isUsed) {
@@ -830,6 +1091,23 @@ void decodeV2GTP(void) {
 
     } else if (fsmState == stateWaitForCableCheckRequest) {
 
+        if (g_hlc_protocol == HlcProtocol::Iso2) {
+            if (iso2DocDec.V2G_Message.Body.CableCheckReq_isUsed) {
+                Serial.println("[ISO-2] CableCheckReq");
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.CableCheckRes_isUsed = 1;
+                init_iso2CableCheckResType(&iso2DocEnc.V2G_Message.Body.CableCheckRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.CableCheckRes;
+                res.ResponseCode = iso2_responseCodeType_OK;
+                iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
+                res.EVSEProcessing = iso2_EVSEProcessingType_Finished;
+                send_iso2_message();
+                fsmState = stateWaitForPreChargeRequest;
+                iso_watchdog_start(stateWaitForPreChargeRequest);
+                return;
+            }
+        }
+
         if (dinDocDec.V2G_Message.Body.CableCheckReq_isUsed) {
             prepare_din_message();
             dinDocEnc.V2G_Message.Body.CableCheckRes_isUsed = 1;
@@ -844,6 +1122,23 @@ void decodeV2GTP(void) {
 
     } else if (fsmState == stateWaitForPreChargeRequest) {
 
+        if (g_hlc_protocol == HlcProtocol::Iso2) {
+            if (iso2DocDec.V2G_Message.Body.PreChargeReq_isUsed) {
+                Serial.println("[ISO-2] PreChargeReq");
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.PreChargeRes_isUsed = 1;
+                init_iso2PreChargeResType(&iso2DocEnc.V2G_Message.Body.PreChargeRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.PreChargeRes;
+                res.ResponseCode = iso2_responseCodeType_OK;
+                iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
+                iso_set_physical_value(&res.EVSEPresentVoltage, iso2_unitSymbolType_V, dc_get_bus_voltage());
+                send_iso2_message();
+                fsmState = stateWaitForPowerDeliveryRequest;
+                iso_watchdog_start(stateWaitForPowerDeliveryRequest);
+                return;
+            }
+        }
+
         if (dinDocDec.V2G_Message.Body.PreChargeReq_isUsed) {
             prepare_din_message();
             dinDocEnc.V2G_Message.Body.PreChargeRes_isUsed = 1;
@@ -857,6 +1152,28 @@ void decodeV2GTP(void) {
         }
 
     } else if (fsmState == stateWaitForPowerDeliveryRequest) {
+
+        if (g_hlc_protocol == HlcProtocol::Iso2) {
+            if (iso2DocDec.V2G_Message.Body.PowerDeliveryReq_isUsed) {
+                auto progress = iso2DocDec.V2G_Message.Body.PowerDeliveryReq.ChargeProgress;
+                uint8_t nextState = stateWaitForSessionStopRequest;
+                bool contactorOk = true;
+                iso2_responseCodeType resp = iso_process_power_delivery(progress, contactorOk, nextState);
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.PowerDeliveryRes_isUsed = 1;
+                init_iso2PowerDeliveryResType(&iso2DocEnc.V2G_Message.Body.PowerDeliveryRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.PowerDeliveryRes;
+                res.ResponseCode = resp;
+                res.AC_EVSEStatus_isUsed = 0;
+                res.EVSEStatus_isUsed = 0;
+                res.DC_EVSEStatus_isUsed = 1;
+                iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
+                send_iso2_message();
+                fsmState = nextState;
+                iso_watchdog_start(nextState);
+                return;
+            }
+        }
 
         if (dinDocDec.V2G_Message.Body.PowerDeliveryReq_isUsed) {
             bool ready = dinDocDec.V2G_Message.Body.PowerDeliveryReq.ReadyToChargeState != 0;
@@ -889,6 +1206,66 @@ void decodeV2GTP(void) {
         }
 
     } else if (fsmState == stateWaitForCurrentDemandRequest) {
+
+        if (g_hlc_protocol == HlcProtocol::Iso2) {
+            if (iso2DocDec.V2G_Message.Body.PowerDeliveryReq_isUsed) {
+                auto progress = iso2DocDec.V2G_Message.Body.PowerDeliveryReq.ChargeProgress;
+                uint8_t nextState = stateWaitForSessionStopRequest;
+                bool contactorOk = true;
+                iso2_responseCodeType resp = iso_process_power_delivery(progress, contactorOk, nextState);
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.PowerDeliveryRes_isUsed = 1;
+                init_iso2PowerDeliveryResType(&iso2DocEnc.V2G_Message.Body.PowerDeliveryRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.PowerDeliveryRes;
+                res.ResponseCode = resp;
+                res.AC_EVSEStatus_isUsed = 0;
+                res.EVSEStatus_isUsed = 0;
+                res.DC_EVSEStatus_isUsed = 1;
+                iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
+                send_iso2_message();
+                fsmState = nextState;
+                return;
+            } else if (iso2DocDec.V2G_Message.Body.CurrentDemandReq_isUsed) {
+                const auto &req = iso2DocDec.V2G_Message.Body.CurrentDemandReq;
+                float targetVoltage = iso_decode_physical_value(req.EVTargetVoltage);
+                float targetCurrent = iso_decode_physical_value(req.EVTargetCurrent);
+                if (targetVoltage < 0) targetVoltage = 0;
+                if (targetCurrent < 0) targetCurrent = 0;
+                dc_set_targets(targetVoltage, targetCurrent);
+                chargingActive = true;
+
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.CurrentDemandRes_isUsed = 1;
+                init_iso2CurrentDemandResType(&iso2DocEnc.V2G_Message.Body.CurrentDemandRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.CurrentDemandRes;
+                res.ResponseCode = iso2_responseCodeType_OK;
+                iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
+                float presentVoltage = dc_get_bus_voltage();
+                float presentCurrent = dc_get_bus_current();
+                iso_set_physical_value(&res.EVSEPresentVoltage, iso2_unitSymbolType_V, presentVoltage);
+                iso_set_physical_value(&res.EVSEPresentCurrent, iso2_unitSymbolType_A, presentCurrent);
+                res.EVSECurrentLimitAchieved = (targetCurrent >= EVSE_MAX_CURRENT);
+                res.EVSEVoltageLimitAchieved = (targetVoltage >= EVSE_MAX_VOLTAGE);
+                res.EVSEPowerLimitAchieved =
+                    ((targetVoltage * targetCurrent) >= (EVSE_MAX_POWER_KW * 1000.0f));
+                iso_set_physical_value(&res.EVSEMaximumVoltageLimit, iso2_unitSymbolType_V, EVSE_MAX_VOLTAGE);
+                res.EVSEMaximumVoltageLimit_isUsed = 1;
+                iso_set_physical_value(&res.EVSEMaximumCurrentLimit, iso2_unitSymbolType_A, EVSE_MAX_CURRENT);
+                res.EVSEMaximumCurrentLimit_isUsed = 1;
+                iso_set_physical_value(&res.EVSEMaximumPowerLimit, iso2_unitSymbolType_W,
+                                       EVSE_MAX_POWER_KW * 1000.0f);
+                res.EVSEMaximumPowerLimit_isUsed = 1;
+                iso_set_evse_id(res.EVSEID.characters, res.EVSEID.charactersLen, iso2_EVSEID_CHARACTER_SIZE);
+                res.SAScheduleTupleID = kDefaultSasTupleId;
+                res.MeterInfo_isUsed = 0;
+                res.ReceiptRequired_isUsed = 0;
+                send_iso2_message();
+                iso_watchdog_start(stateWaitForCurrentDemandRequest);
+                return;
+            } else if (handle_iso_metering_receipt()) {
+                // stay in current demand
+            }
+        }
 
         if (dinDocDec.V2G_Message.Body.PowerDeliveryReq_isUsed) {
             bool ready = dinDocDec.V2G_Message.Body.PowerDeliveryReq.ReadyToChargeState != 0;
@@ -959,6 +1336,39 @@ void decodeV2GTP(void) {
         }
 
     } else if (fsmState == stateWaitForSessionStopRequest) {
+
+        if (g_hlc_protocol == HlcProtocol::Iso2) {
+            if (handle_iso_metering_receipt()) {
+                // wait for SessionStopReq
+            } else if (iso2DocDec.V2G_Message.Body.SessionStopReq_isUsed) {
+                Serial.println("[ISO-2] SessionStopReq");
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.SessionStopRes_isUsed = 1;
+                init_iso2SessionStopResType(&iso2DocEnc.V2G_Message.Body.SessionStopRes);
+                iso2DocEnc.V2G_Message.Body.SessionStopRes.ResponseCode = iso2_responseCodeType_OK;
+                send_iso2_message();
+                stop_evse_power_output();
+                fsmState = stateWaitForSupportedApplicationProtocolRequest;
+                return;
+            } else if (iso2DocDec.V2G_Message.Body.PowerDeliveryReq_isUsed) {
+                auto progress = iso2DocDec.V2G_Message.Body.PowerDeliveryReq.ChargeProgress;
+                uint8_t nextState = stateWaitForSessionStopRequest;
+                bool contactorOk = true;
+                iso2_responseCodeType resp = iso_process_power_delivery(progress, contactorOk, nextState);
+                prepare_iso2_message();
+                iso2DocEnc.V2G_Message.Body.PowerDeliveryRes_isUsed = 1;
+                init_iso2PowerDeliveryResType(&iso2DocEnc.V2G_Message.Body.PowerDeliveryRes);
+                auto &res = iso2DocEnc.V2G_Message.Body.PowerDeliveryRes;
+                res.ResponseCode = resp;
+                res.AC_EVSEStatus_isUsed = 0;
+                res.EVSEStatus_isUsed = 0;
+                res.DC_EVSEStatus_isUsed = 1;
+                iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
+                send_iso2_message();
+                fsmState = nextState;
+                return;
+            }
+        }
 
         if (handleMeteringReceipt()) {
             // wait for SessionStopReq

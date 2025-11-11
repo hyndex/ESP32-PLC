@@ -22,6 +22,16 @@
 #define CP_CONNECTED_DUTY_PCT 5
 #endif
 
+#ifndef EVSE_MAX_VOLTAGE
+#define EVSE_MAX_VOLTAGE 500
+#endif
+#ifndef EVSE_MAX_CURRENT
+#define EVSE_MAX_CURRENT 200
+#endif
+#ifndef EVSE_MAX_POWER_KW
+#define EVSE_MAX_POWER_KW 150
+#endif
+
 #ifndef CP_ADC_PIN
 #define CP_ADC_PIN        1
 #endif
@@ -123,4 +133,28 @@
 #endif
 #ifndef DC_RAMP_TICK_MS
 #define DC_RAMP_TICK_MS 100
+#endif
+
+#ifndef ISO20_ENABLE
+#define ISO20_ENABLE 1
+#endif
+
+#ifndef ISO20_INTERFACE_NAME
+#define ISO20_INTERFACE_NAME "plc0"
+#endif
+
+#ifndef ISO20_SDP_ENABLE
+#define ISO20_SDP_ENABLE 1
+#endif
+
+#ifndef ISO20_TLS_STRATEGY
+#define ISO20_TLS_STRATEGY 0  // 0: accept offer, 1: enforce TLS, 2: enforce no TLS
+#endif
+
+#ifndef DIAG_AUTH_TOKEN
+#define DIAG_AUTH_TOKEN "changeme"
+#endif
+
+#ifndef DIAG_AUTH_WINDOW_MS
+#define DIAG_AUTH_WINDOW_MS (5UL * 60UL * 1000UL)
 #endif

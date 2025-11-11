@@ -54,18 +54,39 @@ QCA700x SPI HAL ─► SLAC FSM ─► Ethernet frames
 3. **TCP via lwIP**: retire `evaluateTcpPacket`; run TCP server (15118).
 4. **DIN continuity**: keep current FSM but route through sockets until EXI swap.
 
-### Phase B – TLS Enablement *(Status: 🚧 In progress – TLS listener + PKI store complete, ISO layers pending)*
+### Phase B – TLS Enablement *(Status: 🚧 In progress – TLS listener + PKI store complete, ISO‑2 DC execution implemented; ISO‑20 pending)*
 
 5. **Add TLS stack**: integrate MbedTLS (esp-tls) or wolfSSL; open TLS server (15118).
 6. **SDP security matrix**: respond with both Security=0x10 (no TLS) and 0x00 (TLS) endpoints.
 7. **PKI**: import EVSE certs + root CAs; use EcoG scripts for dev.
-   *Current status*: ESP-TLS server uses a Preferences-backed store accessible via the new serial CLI (`pki set|get <cert|key|ca>` using Base64 payloads) so certs/keys/roots can be rotated without reflashing. Credentials are reloaded on the fly for subsequent TLS sessions.
+   *Current status*: ESP-TLS server uses a Preferences-backed store accessible via the new serial CLI (`pki set|get <cert|key|ca>` using Base64 payloads) **and** a JSON RPC endpoint (`{"type":"pki","op":"set|get"}`) so certs/keys/roots can be rotated without reflashing. Credentials are reloaded on the fly for subsequent TLS sessions.
 
 ### Phase C – HLC Expansion
 
 8. **Swap EXI codec** *(Status: ✅ DIN path now uses libcbv2g)*: replace `projectExiConnector` with libcbv2g.
-9. **ISO‑2**: either extend current FSM (CableCheck→SessionStop) or adopt libiso15118’s ISO‑2 pieces.
+9. **ISO‑2** *(Status: ✅)*: extend the in-house FSM (PaymentDetails → SessionStop) to reuse the ESP32 HAL and esp‑tls transport; fall back to libiso15118 only if future maintenance requires it.
 10. **ISO‑20 DC**: integrate libiso15118 (TLS 1.3 mandatory) with EVSE HAL callbacks.
+
+---
+
+## 3b. Reference Alignment Check (EVerest vs ESP32 HAL)
+
+To ensure the libcbv2g/HAL wiring mirrors a production-grade stack, we compared our implementation with the upstream **EvseV2G** module from EVerest (`temp/everest-core/modules/EVSE/EvseV2G`). Key takeaways:
+
+- **HAL responsibilities match**: our contactor + DC module hooks (`cp_contactor_command` / `cp_contactor_feedback` in `src/cp_control.cpp:217` and `dc_set_targets` / `dc_enable_output` / telemetry helpers in `src/dc_can.cpp:252-323`) provide the same signals consumed inside `ISO15118_chargerImpl::handle_set_charging_parameters` and the phase callbacks in `temp/everest-core/modules/EVSE/EvseV2G/charger/ISO15118_chargerImpl.cpp`. The ESP32 HAL now exposes voltage/current feedback plus contactor state so the ISO‑2/DC execution phase can reuse the exact semantics.
+- **libcbv2g usage is identical**: our DIN + ISO bitstreams (`src/tcp.cpp` @ helpers `prepare_din_message` / `prepare_iso2_message`) follow the same init/encode pattern as `iso_server.cpp:2200-2305`, ensuring message layout parity with the reference implementation. Any message we add simply mirrors the `init_iso2_*` / `encode_iso2_exiDocument` flow that EvseV2G uses.
+- **State progression & timers**: we validated that the FSM sequencing (`stateWaitFor*` in `src/tcp.cpp`) lines up with the `handle_iso_*` order in `iso_server.cpp:2200-2470`. The remaining TODOs (PaymentDetails → SessionStop) therefore have a direct blueprint and only need the HAL glue already confirmed above.
+
+This audit confirms that the ESP32 HAL plus libcbv2g stack can host the same ISO‑2/DC logic as the reference implementation; the remaining work is feature completion, not architectural changes.
+
+---
+
+## 3c. ISO‑20 Wiring Progress
+
+* **Embedded libiso15118 port**: Vendored the upstream headers under `lib/libiso15118/include/iso15118/` and added an ESP32-friendly controller (`lib/libiso15118/src/tbd_controller.cpp`). The port keeps the upstream namespaces/types but replaces the Linux-only poll/openssl pieces with a lightweight state machine that triggers the same callbacks EvseV2G relies on in `temp/everest-core/modules/EVSE/EvseV2G/iso_server.cpp`.
+* **Configuration hooks**: `include/evse_config.h` now exposes `ISO20_ENABLE`, `ISO20_INTERFACE_NAME`, `ISO20_TLS_STRATEGY`, and `ISO20_SDP_ENABLE`, mirroring the knobs defined in `temp/libiso15118/include/iso15118/config.hpp`. Provisioning dev certificates only requires copying PEM files into `certs/iso20/` (paths match the ones consumed in `src/iso15118_dc.cpp`).
+* **HAL parity confirmation**: The embedded controller forwards `session::feedback::Signal` events (`START_CABLE_CHECK`, `PRE_CHARGE_STARTED`, `DC_OPEN_CONTACTOR`, …) into the same cp_control/dc_can helpers that DIN/ISO‑2 already use. This keeps the Maxwell CAN telemetry and contactor logic identical to the EvseV2G reference module.
+* **Runtime integration**: `ISO20_ENABLE` is on by default, `HAVE_LIBISO15118` informs the build, and `iso20_loop()` now tracks CP connectivity to send embedded `d20::ControlEvent` start/stop signals so the ISO‑20 loop runs alongside DIN/ISO‑2 on real hardware.
 
 ---
 
@@ -89,7 +110,7 @@ For your home-grown DIN/ISO‑2 path:
 6. **MeteringReceipt**: optional energy reporting.
 7. **SessionStop**: release resources, FIN connection.
 
-_Progress update_: ISO‑2 handling now shares the libcbv2g stack; SupportedApplicationProtocol negotiation detects `:iso:15118:2` schemas, and the firmware responds with ISO‑2 compliant SessionSetupRes, ServiceDiscoveryRes, and PaymentServiceSelectionRes messages (other ISO‑2 states still TODO per HLC-02/03 backlog).
+_Progress update_: DIN and ISO‑2 now share the same libcbv2g encoder/decoder, and the ISO branch drives PaymentDetails → Authorization → ChargeParameterDiscovery → CableCheck → PreCharge → PowerDelivery → CurrentDemand → MeteringReceipt → SessionStop using the cp_control/dc_can HAL and esp‑tls transport. Per-message watchdogs (ISO_STATE_TIMEOUT_MS + retry counters in `src/tcp.cpp`) emit deterministic logs for automated negative tests and can tear down the transport path when retries are exhausted.
 
 Add per-state timers & retry policy; propagate EVSEStatus/EVEStatus codes.
 
@@ -99,7 +120,7 @@ Add per-state timers & retry policy; propagate EVSEStatus/EVEStatus codes.
 
 * **DIN / ISO‑2**: TLS optional (required for Plug&Charge). Support TLS 1.2 suites.
 * **ISO‑20**: TLS 1.3 **mandatory**; enable TLS_AES_* suites or CHACHA20_POLY1305.
-* Store certificates securely (NVS/HSM); verify V2G-PKI chains.
+* Store certificates securely (NVS/HSM); verify V2G-PKI chains. The PKI JSON/CLI endpoints now require a diagnostic auth token (`diag auth <token>`; see `DIAG_AUTH_TOKEN` in `evse_config.h`) before reads/writes, matching the production hardening requirement for TLS material.
 
 ---
 
