@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include "main.h"
 #include "tcp.h"
+#include "evse_config.h"
+#include "tls_server.h"
 
 const uint8_t broadcastIPv6[16] = { 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 /* our link-local IPv6 address. Based on myMac, but with 0xFFFE in the middle, and bit 1 of MSB inverted */
@@ -19,9 +21,18 @@ uint8_t NeighborsIp[16];
 uint8_t DiscoveryReqSecurity;
 uint8_t DiscoveryReqTransportProtocol;
 
+static constexpr uint8_t kSdpSecurityTls = 0x00;
+static constexpr uint8_t kSdpSecurityNoTls = 0x10;
+static constexpr uint8_t kSdpTransportTcp = 0x00;
+
+static uint8_t g_activeSdpSecurity = kSdpSecurityNoTls;
+static uint8_t g_activeSdpTransport = kSdpTransportTcp;
+static uint16_t g_activeSeccPort = TCP_PLAIN_PORT;
+
 
 
 #define NEXT_UDP 0x11 /* next protocol is UDP */
+#define NEXT_TCP 0x06  /* next protocol is TCP */
 #define NEXT_ICMPv6 0x3a /* next protocol is ICMPv6 */
 
 #define UDP_PAYLOAD_LEN 100
@@ -43,6 +54,66 @@ uint8_t IpResponse[IP_RESPONSE_LEN];
 #define PSEUDO_HEADER_LEN 40
 uint8_t pseudoHeader[PSEUDO_HEADER_LEN];
 
+static const uint16_t IPV6_HEADER_OFFSET = 14;
+static const uint16_t IPV6_FIXED_HEADER_LEN = 40;
+static const uint16_t IPV6_PAYLOAD_OFFSET = IPV6_HEADER_OFFSET + IPV6_FIXED_HEADER_LEN;
+
+#ifndef PLC_TRACE_IPV6
+#define PLC_TRACE_IPV6 0
+#endif
+
+static bool isIpv6ExtensionHeader(uint8_t nextHeader) {
+    switch (nextHeader) {
+        case 0:   // Hop-by-hop
+        case 43:  // Routing
+        case 44:  // Fragment
+        case 50:  // ESP
+        case 51:  // AH
+        case 60:  // Destination options
+        case 135: // Mobility
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool computeIpv6PayloadMetadata(uint16_t rxbytes, uint8_t *nextHeader, uint16_t *payloadOffset, uint16_t *payloadLength) {
+    if (rxbytes < IPV6_PAYLOAD_OFFSET) {
+        return false;
+    }
+    uint16_t ipv6PayloadLen = (rxbuffer[IPV6_HEADER_OFFSET + 4] << 8) | rxbuffer[IPV6_HEADER_OFFSET + 5];
+    if (rxbytes < IPV6_PAYLOAD_OFFSET + ipv6PayloadLen) {
+        return false;
+    }
+
+    uint16_t offset = IPV6_PAYLOAD_OFFSET;
+    uint16_t consumed = 0;
+    uint8_t currentHeader = rxbuffer[IPV6_HEADER_OFFSET + 6];
+
+    while (isIpv6ExtensionHeader(currentHeader)) {
+        if (offset + 2 > IPV6_PAYLOAD_OFFSET + ipv6PayloadLen) {
+            return false;
+        }
+        uint8_t next = rxbuffer[offset];
+        uint8_t hdrLenUnits = rxbuffer[offset + 1];
+        uint16_t headerBytes = (uint16_t)(hdrLenUnits + 1) * 8;
+        if (offset + headerBytes > IPV6_PAYLOAD_OFFSET + ipv6PayloadLen) {
+            return false;
+        }
+        offset += headerBytes;
+        consumed += headerBytes;
+        currentHeader = next;
+    }
+
+    if (consumed > ipv6PayloadLen) {
+        return false;
+    }
+    *payloadOffset = offset;
+    *payloadLength = ipv6PayloadLen - consumed;
+    *nextHeader = currentHeader;
+    return true;
+}
+
 void setSeccIp() {
     // Create a link-local Ipv6 address based on myMac (the MAC of the ESP32).
     memset(SeccIp, 0, 16);
@@ -60,68 +131,42 @@ void setSeccIp() {
 }
 
 
-uint16_t calculateUdpAndTcpChecksumForIPv6(uint8_t *UdpOrTcpframe, uint16_t UdpOrTcpframeLen, const uint8_t *ipv6source, const uint8_t *ipv6dest, uint8_t nxt) {
-	uint16_t evenFrameLen, i, value16, checksum;
-	uint32_t totalSum;
-    // Parameters:
-    // UdpOrTcpframe: the udp frame or tcp frame, including udp/tcp header and udp/tcp payload
-    // ipv6source: the 16 byte IPv6 source address. Must be the same, which is used later for the transmission.
-    // ipv6source: the 16 byte IPv6 destination address. Must be the same, which is used later for the transmission.
-	// nxt: The next-protocol. 0x11 for UDP, ... for TCP.
-	//
-    // Goal: construct an array, consisting of a 40-byte-pseudo-ipv6-header, and the udp frame (consisting of udp header and udppayload).
-	// For memory efficienty reason, we do NOT copy the pseudoheader and the udp frame together into one new array. Instead, we are using
-	// a dedicated pseudo-header-array, and the original udp buffer.
-	evenFrameLen = UdpOrTcpframeLen;
-	if ((evenFrameLen & 1)!=0) {
-        /* if we have an odd buffer length, we need to add a padding byte in the end, because the sum calculation
-           will need 16-bit-aligned data. */
-		evenFrameLen++;
-		UdpOrTcpframe[evenFrameLen-1] = 0; /* Fill the padding byte with zero. */
-	}
-    memset(pseudoHeader, 0, PSEUDO_HEADER_LEN);
-    /* fill the pseudo-ipv6-header */
-    for (i=0; i<16; i++) { /* copy 16 bytes IPv6 addresses */
-        pseudoHeader[i] = ipv6source[i]; /* IPv6 source address */
-        pseudoHeader[16+i] = ipv6dest[i]; /* IPv6 destination address */
-	}
-    pseudoHeader[32] = 0; // # high byte of the FOUR byte length is always 0
-    pseudoHeader[33] = 0; // # 2nd byte of the FOUR byte length is always 0
-    pseudoHeader[34] = UdpOrTcpframeLen >> 8; // # 3rd
-    pseudoHeader[35] = UdpOrTcpframeLen & 0xFF; // # low byte of the FOUR byte length
-    pseudoHeader[36] = 0; // # 3 padding bytes with 0x00
-    pseudoHeader[37] = 0;
-    pseudoHeader[38] = 0;
-    pseudoHeader[39] = nxt; // # the nxt is at the end of the pseudo header
-    // pseudo-ipv6-header finished.
-    // Run the checksum over the concatenation of the pseudoheader and the buffer.
+static uint32_t foldChecksum(uint32_t sum) {
+    while (sum > 0xFFFF) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return sum;
+}
 
-  
-    totalSum = 0;
-	for (i=0; i<PSEUDO_HEADER_LEN/2; i++) { // running through the pseudo header, in 2-byte-steps
-        value16 = pseudoHeader[2*i] * 256 + pseudoHeader[2*i+1]; // take the current 16-bit-word
-        totalSum += value16; // we start with a normal addition of the value to the totalSum
-        // But we do not want normal addition, we want a 16 bit one's complement sum,
-        // see https://en.wikipedia.org/wiki/User_Datagram_Protocol
-        if (totalSum>=65536) { // On each addition, if a carry-out (17th bit) is produced, 
-            totalSum-=65536; // swing that 17th carry bit around 
-            totalSum+=1; // and add it to the least significant bit of the running total.
-		}
-	}
-	for (i=0; i<evenFrameLen/2; i++) { // running through the udp buffer, in 2-byte-steps
-        value16 = UdpOrTcpframe[2*i] * 256 + UdpOrTcpframe[2*i+1]; // take the current 16-bit-word
-        totalSum += value16; // we start with a normal addition of the value to the totalSum
-        // But we do not want normal addition, we want a 16 bit one's complement sum,
-        // see https://en.wikipedia.org/wiki/User_Datagram_Protocol
-        if (totalSum>=65536) { // On each addition, if a carry-out (17th bit) is produced, 
-            totalSum-=65536; // swing that 17th carry bit around 
-            totalSum+=1; // and add it to the least significant bit of the running total.
-		}
-	}
-    // Finally, the sum is then one's complemented to yield the value of the UDP checksum field.
-    checksum = (uint16_t) (totalSum ^ 0xffff);
-    
-    return checksum;
+uint16_t calculateUdpAndTcpChecksumForIPv6(uint8_t *UdpOrTcpframe, uint16_t UdpOrTcpframeLen, const uint8_t *ipv6source, const uint8_t *ipv6dest, uint8_t nxt) {
+    uint32_t sum = 0;
+    uint16_t i;
+
+    for (i = 0; i < 16; i += 2) {
+        sum += (ipv6source[i] << 8) | ipv6source[i + 1];
+        sum += (ipv6dest[i] << 8) | ipv6dest[i + 1];
+        sum = foldChecksum(sum);
+    }
+
+    sum += (UdpOrTcpframeLen >> 16) & 0xFFFF;
+    sum = foldChecksum(sum);
+    sum += (UdpOrTcpframeLen & 0xFFFF);
+    sum = foldChecksum(sum);
+
+    sum += nxt; // three padding bytes are zero
+    sum = foldChecksum(sum);
+
+    for (i = 0; i + 1 < UdpOrTcpframeLen; i += 2) {
+        sum += (UdpOrTcpframe[i] << 8) | UdpOrTcpframe[i + 1];
+        sum = foldChecksum(sum);
+    }
+    if (UdpOrTcpframeLen & 1) {
+        sum += (UdpOrTcpframe[UdpOrTcpframeLen - 1] << 8);
+        sum = foldChecksum(sum);
+    }
+
+    sum = foldChecksum(sum);
+    return (uint16_t)(~sum);
 }
 
 void packResponseIntoEthernet() {
@@ -155,6 +200,10 @@ void packResponseIntoIp(void) {
                                               //  #   2 bytes destination port
                                               //  #   2 bytes length (incl checksum)
                                               //  #   2 bytes checksum
+  if (IpResponseLen > IP_RESPONSE_LEN) {
+      Serial.printf("Error: IPv6 response too large (%u bytes)\n", IpResponseLen);
+      return;
+  }
   IpResponse[0] = 0x60; // # traffic class, flow
   IpResponse[1] = 0; 
   IpResponse[2] = 0;
@@ -163,7 +212,7 @@ void packResponseIntoIp(void) {
   IpResponse[4] = plen >> 8;
   IpResponse[5] = plen & 0xFF;
   IpResponse[6] = 0x11; // next level protocol, 0x11 = UDP in this case
-  IpResponse[7] = 0x0A; // hop limit
+  IpResponse[7] = 0xFF; // hop limit must be 255 on link-local control traffic
     for (i=0; i<16; i++) {
     IpResponse[8+i] = SeccIp[i]; // source IP address
     IpResponse[24+i] = EvccIp[i]; // destination IP address
@@ -186,6 +235,10 @@ void packResponseIntoUdp(void) {
                                         //           #   2 bytes destination port
                                         //           #   2 bytes length (incl checksum)
                                         //           #   2 bytes checksum
+    if (UdpResponseLen > UDP_RESPONSE_LEN) {
+        Serial.printf("Error: UDP response too large (%u bytes)\n", UdpResponseLen);
+        return;
+    }
     UdpResponse[0] = 15118 >> 8;
     UdpResponse[1] = 15118  & 0xFF;
     UdpResponse[2] = evccPort >> 8;
@@ -206,87 +259,125 @@ void packResponseIntoUdp(void) {
 }
 
 
-// SECC Discovery Response.
-// The response from the charger to the EV, which transfers the IPv6 address of the charger to the car.
-void sendSdpResponse() {
-    uint8_t i, lenSdp;
-    uint8_t SdpPayload[20]; // SDP response has 20 bytes
+uint16_t buildSdpResponseFrame(uint8_t *out, uint16_t maxLen) {
+    const uint16_t payloadLen = 20;
+    const uint16_t totalLen = payloadLen + V2GTP_HEADER_SIZE;
+    if (maxLen < totalLen) {
+        Serial.printf("Error: SDP payload does not fit in buffer (%u)\n", maxLen);
+        return 0;
+    }
 
-    memcpy(SdpPayload, SeccIp, 16); // 16 bytes IPv6 address of the charger.
-                                    // This IP address is based on the MAC of the ESP32, with 0xfffe in the middle.
-    // Here the charger decides, on which port he will listen for the TCP communication.
-    // We use port 15118, same as for the SDP. But also dynamically assigned port would be ok.
-    // The alpitronics seems to use different ports on different chargers, e.g. 0xC7A7 and 0xC7A6.
-    // The ABB Triple and ABB HPC are reporting port 0xD121, but in fact (also?) listening
-    // to the port 15118.
-    seccPort = 15118;
-    SdpPayload[16] = seccPort >> 8; // SECC port high byte.
-    SdpPayload[17] = seccPort & 0xff; // SECC port low byte. 
-    SdpPayload[18] = 0x10; // security. We only support "no transport layer security, 0x10".
-    SdpPayload[19] = 0x00; // transport protocol. We only support "TCP, 0x00".
-    
-    // add the SDP header
-    lenSdp = sizeof(SdpPayload);
-    V2GFrame[0] = 0x01; // version
-    V2GFrame[1] = 0xfe; // version inverted
-    V2GFrame[2] = 0x90; // payload type. 0x9001 is the SDP response message
-    V2GFrame[3] = 0x01; // 
-    V2GFrame[4] = (lenSdp >> 24) & 0xff; // 4 byte payload length
-    V2GFrame[5] = (lenSdp >> 16) & 0xff;
-    V2GFrame[6] = (lenSdp >> 8) & 0xff;
-    V2GFrame[7] = lenSdp & 0xff;
-    memcpy(V2GFrame+8, SdpPayload, lenSdp);         // ToDo: Check lenSdp against buffer size!
-    v2gFrameLen = lenSdp + 8;
+    uint8_t *payload = out + V2GTP_HEADER_SIZE;
+    memcpy(payload, SeccIp, 16);
+    payload[16] = g_activeSeccPort >> 8;
+    payload[17] = g_activeSeccPort & 0xff;
+    payload[18] = g_activeSdpSecurity;
+    payload[19] = g_activeSdpTransport;
+
+    out[0] = 0x01;
+    out[1] = 0xfe;
+    out[2] = 0x90;
+    out[3] = 0x01;
+    out[4] = (payloadLen >> 24) & 0xff;
+    out[5] = (payloadLen >> 16) & 0xff;
+    out[6] = (payloadLen >> 8) & 0xff;
+    out[7] = payloadLen & 0xff;
+    return totalLen;
+}
+
+bool handleSdpRequestBuffer(const uint8_t *payload, uint16_t len, const uint8_t *srcIp, uint16_t srcPort) {
+    if (len != 2) return false;
+    DiscoveryReqSecurity = payload[0];
+    DiscoveryReqTransportProtocol = payload[1];
+
+    if (DiscoveryReqTransportProtocol != kSdpTransportTcp) {
+        Serial.printf("DiscoveryReqTransportProtocol %u is not supported\n", DiscoveryReqTransportProtocol);
+        return false;
+    }
+
+    const bool tlsRequested = (DiscoveryReqSecurity == kSdpSecurityTls);
+    const bool plainRequested = (DiscoveryReqSecurity == kSdpSecurityNoTls);
+    if (!tlsRequested && !plainRequested) {
+        Serial.printf("DiscoveryReqSecurity %u is not supported\n", DiscoveryReqSecurity);
+        return false;
+    }
+
+    if (tlsRequested && !tls_server_ready()) {
+        Serial.println("SDP request asked for TLS but TLS server is not ready yet");
+        return false;
+    }
+
+    g_activeSdpSecurity = tlsRequested ? kSdpSecurityTls : kSdpSecurityNoTls;
+    g_activeSdpTransport = kSdpTransportTcp;
+    g_activeSeccPort = tlsRequested ? TCP_TLS_PORT : TCP_PLAIN_PORT;
+    seccPort = g_activeSeccPort;
+
+    Serial.printf("Ok, SDP request accepted. Selected %s endpoint on port %u\n",
+                  tlsRequested ? "TLS" : "TCP", g_activeSeccPort);
+    memcpy(EvccIp, srcIp, 16);
+    evccPort = srcPort;
+    return true;
+}
+
+void sendSdpResponse() {
+    uint16_t len = buildSdpResponseFrame(V2GFrame, sizeof(V2GFrame));
+    if (!len) return;
+    v2gFrameLen = len;
     packResponseIntoUdp();
 }
 
 
-void evaluateUdpPayload(void) {
+void evaluateUdpPayload(uint16_t payloadOffset, uint16_t payloadLen) {
     uint16_t v2gptPayloadType;
     uint32_t v2gptPayloadLen;
-    uint8_t i;
+
+    if (payloadLen < 8) {
+        Serial.printf("Ignoring UDP frame: payload too short (%u)\n", payloadLen);
+        return;
+    }
+
+    sourceport = (rxbuffer[payloadOffset] << 8) | rxbuffer[payloadOffset + 1];
+    destinationport = (rxbuffer[payloadOffset + 2] << 8) | rxbuffer[payloadOffset + 3];
+    udplen = (rxbuffer[payloadOffset + 4] << 8) | rxbuffer[payloadOffset + 5];
+    udpsum = (rxbuffer[payloadOffset + 6] << 8) | rxbuffer[payloadOffset + 7];
+
+    if (udplen > payloadLen) {
+        Serial.printf("Ignoring UDP frame: length mismatch (%u > %u)\n", udplen, payloadLen);
+        return;
+    }
+
+    if (udplen < 8) {
+        Serial.printf("Ignoring UDP frame: invalid header length\n");
+        return;
+    }
+
+    udpPayloadLen = udplen - 8;
+    if (udpPayloadLen > UDP_PAYLOAD_LEN) {
+        Serial.printf("Ignoring UDP payload: %u exceeds buffer\n", udpPayloadLen);
+        return;
+    }
+
+    memcpy(udpPayload, rxbuffer + payloadOffset + 8, udpPayloadLen);
 
     if (destinationport == 15118) { // port for the SECC
-      if ((udpPayload[0] == 0x01) && (udpPayload[1] == 0xFE)) { //# protocol version 1 and inverted
-        // we are the charger, and it is a message from car to charger, lets save the cars IP and port for later use.
-        memcpy(EvccIp, sourceIp, 16);
-        evccPort = sourceport;  
-        //addressManager.setPevIp(EvccIp);
-
-        // it is a V2GTP message                
-        // payload is usually: 01 fe 90 00 00 00 00 02 10 00
-        v2gptPayloadType = udpPayload[2]*256 + udpPayload[3];
-        // 0x8001 EXI encoded V2G message (Will NOT come with UDP. Will come with TCP.)
-        // 0x9000 SDP request message (SECC Discovery)
-        // 0x9001 SDP response message (SECC response to the EVCC)
-        if (v2gptPayloadType == 0x9000) {
-            // it is a SDP request from the car to the charger
-            Serial.printf("it is a SDP request from the car to the charger\n");
+        if ((udpPayloadLen >= 2) && (udpPayload[0] == 0x01) && (udpPayload[1] == 0xFE)) { //# protocol version 1 and inverted
+            v2gptPayloadType = udpPayload[2]*256 + udpPayload[3];
             v2gptPayloadLen = (((uint32_t)udpPayload[4])<<24)  + 
                               (((uint32_t)udpPayload[5])<<16) +
                               (((uint32_t)udpPayload[6])<<8) +
                               udpPayload[7];
-            if (v2gptPayloadLen == 2) {
-                //# 2 is the only valid length for a SDP request.
-                DiscoveryReqSecurity = udpPayload[8]; // normally 0x10 for "no transport layer security". Or 0x00 for "TLS".
-                DiscoveryReqTransportProtocol = udpPayload[9]; // normally 0x00 for TCP
-                if (DiscoveryReqSecurity != 0x10) {
-                    Serial.printf("DiscoveryReqSecurity %u is not supported\n", DiscoveryReqSecurity);
-                } else if (DiscoveryReqTransportProtocol != 0x00) {
-                    Serial.printf("DiscoveryReqTransportProtocol %u is not supported\n", DiscoveryReqTransportProtocol);
-                } else {
-                    // This was a valid SDP request. Let's respond, if we are the charger.
-                    Serial.printf("Ok, this was a valid SDP request. We are the SECC. Sending SDP response.\n");
+            if (v2gptPayloadType == 0x9000) {
+                Serial.printf("it is a SDP request from the car to the charger\n");
+                if (handleSdpRequestBuffer(udpPayload+8, v2gptPayloadLen, sourceIp, sourceport)) {
                     sendSdpResponse();
+                } else {
+                    Serial.printf("SDP request ignored\n");
                 }
-            } else {
-                Serial.printf("v2gptPayloadLen on SDP request is %u not supported\n", v2gptPayloadLen);
-            }
-        } else {    
-            Serial.printf("v2gptPayloadType %04x not supported\n", v2gptPayloadType);
-        }                  
+            } else {    
+                Serial.printf("v2gptPayloadType %04x not supported\n", v2gptPayloadType);
+            }                  
+        }
     }
-  }                
 }
 
 void evaluateNeighborSolicitation(void) {
@@ -376,53 +467,36 @@ void evaluateNeighborSolicitation(void) {
 
 
 void IPv6Manager(uint16_t rxbytes) {
-    uint16_t x;
-    uint16_t nextheader; 
+    uint16_t payloadOffset;
+    uint16_t payloadLen;
+    uint8_t nextheader; 
     uint8_t icmpv6type; 
 
+#if PLC_TRACE_IPV6
     Serial.printf("\n[RX] ");
-    for (x=0; x<rxbytes; x++) Serial.printf("%02x",rxbuffer[x]);
+    for (uint16_t x=0; x<rxbytes; x++) Serial.printf("%02x",rxbuffer[x]);
     Serial.printf("\n");
+#endif
 
-    //# The evaluation function for received ipv6 packages.
-  
-    if (rxbytes > 60) {
-        //# extract the source ipv6 address
-        memcpy(sourceIp, rxbuffer+22, 16);
-        nextheader = rxbuffer[20];
-        if (nextheader == 0x11) { //  it is an UDP frame
-            Serial.printf("Its a UDP.\n");
-            sourceport = rxbuffer[54]*256 + rxbuffer[55];
-            destinationport = rxbuffer[56]*256 + rxbuffer[57];
-            udplen = rxbuffer[58]*256 + rxbuffer[59];
-            udpsum = rxbuffer[60]*256 + rxbuffer[61];
+    if (!computeIpv6PayloadMetadata(rxbytes, &nextheader, &payloadOffset, &payloadLen)) {
+        Serial.printf("Ignoring malformed IPv6 frame (len=%u)\n", rxbytes);
+        return;
+    }
 
-            //# udplen is including 8 bytes header at the begin
-            if (udplen>UDP_PAYLOAD_LEN) {
-                /* ignore long UDP */
-                Serial.printf("Ignoring too long UDP\n");
-                return;
-            }
-            if (udplen>8) {
-                udpPayloadLen = udplen-8;
-                for (x=0; x<udplen-8; x++) {
-                    udpPayload[x] = rxbuffer[62+x];
-                }
-                evaluateUdpPayload();
-            }                      
-        }
-        if (nextheader == 0x06) { // # it is an TCP frame
-            Serial.printf("TCP received\n");
-            evaluateTcpPacket();
-        }
-        if (nextheader == NEXT_ICMPv6) { // it is an ICMPv6 (NeighborSolicitation etc) frame
-            Serial.printf("ICMPv6 received\n");
-            icmpv6type = rxbuffer[54];
-            if (icmpv6type == 0x87) { /* Neighbor Solicitation */
-                Serial.printf("Neighbor Solicitation received\n");
-                evaluateNeighborSolicitation();
-            }
-        }
-  }
+    memcpy(sourceIp, rxbuffer+IPV6_HEADER_OFFSET+8, 16);
 
+    if (nextheader == NEXT_UDP) {
+        evaluateUdpPayload(payloadOffset, payloadLen);
+    } else if (nextheader == 0x06) {
+        Serial.printf("TCP received\n");
+        evaluateTcpPacket(payloadOffset, payloadLen);
+    } else if (nextheader == NEXT_ICMPv6) {
+        Serial.printf("ICMPv6 received\n");
+        if (payloadLen == 0) return;
+        icmpv6type = rxbuffer[payloadOffset];
+        if (icmpv6type == 0x87 && payloadOffset == IPV6_PAYLOAD_OFFSET) {
+            Serial.printf("Neighbor Solicitation received\n");
+            evaluateNeighborSolicitation();
+        }
+    }
 }

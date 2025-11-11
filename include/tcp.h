@@ -1,3 +1,10 @@
-void evaluateTcpPacket(void);
+void evaluateTcpPacket(uint16_t payloadOffset, uint16_t payloadLen);
 void tcp_prepareTcpHeader(uint8_t tcpFlag);
 void tcp_packRequestIntoIp(void);
+void tcp_tick(void);
+void addV2GTPHeaderAndTransmit(const uint8_t *exiBuffer, uint16_t exiBufferLen);
+void decodeV2GTP(void);
+void tcp_register_socket_sender(void (*cb)(const uint8_t *, uint16_t));
+void tcp_process_socket_payload(const uint8_t *payload, uint16_t len);
+void tcp_transport_reset(void);
+void tcp_transport_connected(void);
