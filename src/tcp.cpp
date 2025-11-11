@@ -8,6 +8,7 @@
 #include "cp_control.h"
 #include "dc_can.h"
 #include "evse_config.h"
+#include "iso_watchdog.h"
 #ifdef ESP_PLATFORM
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -200,25 +201,18 @@ static iso2_DC_EVSEStatusCodeType iso_current_evse_status_code(void);
 static void iso_set_evse_id(char *buffer, uint16_t &len, size_t maxLen);
 static bool handle_iso_metering_receipt(void);
 static void stop_evse_power_output(void);
-static void iso_watchdog_start(uint8_t state);
-static void iso_watchdog_clear(void);
-static void iso_watchdog_check(void);
 static bool decode_iso2_message(void);
 static void prepare_iso2_message(void);
 static bool send_iso2_message(void);
+static inline void iso_watchdog_start_state(uint8_t state) {
+    if (g_hlc_protocol == HlcProtocol::Iso2) {
+        iso_watchdog_start(state, millis());
+    }
+}
 
 const int16_t EVSE_PRESENT_VOLTAGE = 400;
 const int16_t EVSE_PRESENT_CURRENT = 0;
 bool chargingActive = false;
-static uint32_t g_iso_state_start_ms = 0;
-static uint8_t g_iso_state_watchdog = 0;
-static uint8_t g_iso_watchdog_retries = 0;
-#ifndef ISO_STATE_TIMEOUT_MS
-#define ISO_STATE_TIMEOUT_MS 4000UL
-#endif
-#ifndef ISO_STATE_WATCHDOG_MAX_RETRIES
-#define ISO_STATE_WATCHDOG_MAX_RETRIES 3
-#endif
 
 static float decodePhysicalValue(const dinPhysicalValueType &value) {
     float scale = powf(10.0f, (float)value.Multiplier);
@@ -333,38 +327,6 @@ static void stop_evse_power_output(void) {
     dc_set_targets(0.0f, 0.0f);
     dc_enable_output(false);
     cp_contactor_command(false);
-}
-
-static void iso_watchdog_start(uint8_t state) {
-    if (g_hlc_protocol != HlcProtocol::Iso2) return;
-    g_iso_state_watchdog = state;
-    g_iso_state_start_ms = millis();
-    g_iso_watchdog_retries = 0;
-}
-
-static void iso_watchdog_clear(void) {
-    g_iso_state_watchdog = 0;
-    g_iso_state_start_ms = 0;
-    g_iso_watchdog_retries = 0;
-}
-
-static void iso_watchdog_check(void) {
-    if (g_hlc_protocol != HlcProtocol::Iso2) return;
-    if (g_iso_state_watchdog == 0) return;
-    uint32_t now = millis();
-    if ((int32_t)(now - g_iso_state_start_ms) > (int32_t)ISO_STATE_TIMEOUT_MS) {
-        g_iso_watchdog_retries++;
-        Serial.printf("[ISO-2] State %u watchdog timeout (retry %u/%u)\n",
-                      g_iso_state_watchdog,
-                      g_iso_watchdog_retries,
-                      (unsigned)ISO_STATE_WATCHDOG_MAX_RETRIES);
-        resetHlcSession();
-        if (g_iso_watchdog_retries >= ISO_STATE_WATCHDOG_MAX_RETRIES) {
-            Serial.println("[ISO-2] Watchdog retries exhausted, forcing transport reset");
-            tcp_transport_reset();
-            g_iso_watchdog_retries = 0;
-        }
-    }
 }
 
 static iso2_responseCodeType iso_process_power_delivery(iso2_chargeProgressType progress,
@@ -642,7 +604,16 @@ void tcp_tick(void) {
             resetHlcSession();
         }
     }
-    iso_watchdog_check();
+    uint8_t watchdogState = 0;
+    IsoWatchdogResult wd = iso_watchdog_check(now, &watchdogState);
+    if (wd == IsoWatchdogResult::Timeout) {
+        Serial.printf("[ISO-2] State %u watchdog timeout\n", watchdogState);
+        resetHlcSession();
+    } else if (wd == IsoWatchdogResult::Fatal) {
+        Serial.printf("[ISO-2] State %u watchdog fatal\n", watchdogState);
+        resetHlcSession();
+        tcp_transport_reset();
+    }
 }
 
 
@@ -750,14 +721,14 @@ void decodeV2GTP(void) {
                         g_hlc_protocol = HlcProtocol::Din;
                         if (send_supported_app_protocol_response(SchemaID)) {
                             fsmState = stateWaitForSessionSetupRequest;
-                            iso_watchdog_start(stateWaitForSessionSetupRequest);
+                            iso_watchdog_start_state(stateWaitForSessionSetupRequest);
                         }
                     } else if (strstr((const char*)strNamespace, ":iso:15118:2") != NULL) {
                         Serial.printf("Detected ISO 15118-2\n");
                         g_hlc_protocol = HlcProtocol::Iso2;
                         if (send_supported_app_protocol_response(SchemaID)) {
                             fsmState = stateWaitForSessionSetupRequest;
-                            iso_watchdog_start(stateWaitForSessionSetupRequest);
+                            iso_watchdog_start_state(stateWaitForSessionSetupRequest);
                         }
                     }
                 }
@@ -786,7 +757,7 @@ void decodeV2GTP(void) {
                 iso2DocEnc.V2G_Message.Body.SessionSetupRes.EVSETimeStamp_isUsed = 0;
                 send_iso2_message();
                 fsmState = stateWaitForServiceDiscoveryRequest;
-                iso_watchdog_start(stateWaitForServiceDiscoveryRequest);
+                iso_watchdog_start_state(stateWaitForServiceDiscoveryRequest);
                 return;
             }
         }
@@ -860,7 +831,7 @@ void decodeV2GTP(void) {
                 }
                 send_iso2_message();
                 fsmState = stateWaitForServicePaymentSelectionRequest;
-                iso_watchdog_start(stateWaitForServicePaymentSelectionRequest);
+                iso_watchdog_start_state(stateWaitForServicePaymentSelectionRequest);
                 return;
             }
         }
@@ -929,7 +900,7 @@ void decodeV2GTP(void) {
                 g_iso_expect_payment_details = (selected == iso2_paymentOptionType_Contract);
                 g_iso_payment_details_done = !g_iso_expect_payment_details;
                 fsmState = stateWaitForContractAuthenticationRequest;
-                iso_watchdog_start(stateWaitForContractAuthenticationRequest);
+                iso_watchdog_start_state(stateWaitForContractAuthenticationRequest);
                 return;
             }
         }
@@ -1002,7 +973,7 @@ void decodeV2GTP(void) {
                 res.EVSEProcessing = iso2_EVSEProcessingType_Finished;
                 send_iso2_message();
                 fsmState = stateWaitForChargeParameterDiscoveryRequest;
-                iso_watchdog_start(stateWaitForChargeParameterDiscoveryRequest);
+                iso_watchdog_start_state(stateWaitForChargeParameterDiscoveryRequest);
                 return;
             }
         }
@@ -1062,7 +1033,7 @@ void decodeV2GTP(void) {
                 res.DC_EVSEChargeParameter.EVSEEnergyToBeDelivered_isUsed = 0;
                 send_iso2_message();
                 fsmState = stateWaitForCableCheckRequest;
-                iso_watchdog_start(stateWaitForCableCheckRequest);
+                iso_watchdog_start_state(stateWaitForCableCheckRequest);
                 return;
             }
         }
@@ -1103,7 +1074,7 @@ void decodeV2GTP(void) {
                 res.EVSEProcessing = iso2_EVSEProcessingType_Finished;
                 send_iso2_message();
                 fsmState = stateWaitForPreChargeRequest;
-                iso_watchdog_start(stateWaitForPreChargeRequest);
+                iso_watchdog_start_state(stateWaitForPreChargeRequest);
                 return;
             }
         }
@@ -1134,7 +1105,7 @@ void decodeV2GTP(void) {
                 iso_set_physical_value(&res.EVSEPresentVoltage, iso2_unitSymbolType_V, dc_get_bus_voltage());
                 send_iso2_message();
                 fsmState = stateWaitForPowerDeliveryRequest;
-                iso_watchdog_start(stateWaitForPowerDeliveryRequest);
+                iso_watchdog_start_state(stateWaitForPowerDeliveryRequest);
                 return;
             }
         }
@@ -1170,7 +1141,7 @@ void decodeV2GTP(void) {
                 iso_populate_dc_evse_status(&res.DC_EVSEStatus, iso_current_evse_status_code());
                 send_iso2_message();
                 fsmState = nextState;
-                iso_watchdog_start(nextState);
+                iso_watchdog_start_state(nextState);
                 return;
             }
         }
@@ -1260,7 +1231,7 @@ void decodeV2GTP(void) {
                 res.MeterInfo_isUsed = 0;
                 res.ReceiptRequired_isUsed = 0;
                 send_iso2_message();
-                iso_watchdog_start(stateWaitForCurrentDemandRequest);
+                iso_watchdog_start_state(stateWaitForCurrentDemandRequest);
                 return;
             } else if (handle_iso_metering_receipt()) {
                 // stay in current demand

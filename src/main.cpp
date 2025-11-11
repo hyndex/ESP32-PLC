@@ -56,6 +56,8 @@
 #include "tls_server.h"
 #include "tls_credentials.h"
 #include "iso15118_dc.h"
+#include "diag_auth.h"
+#include "iso_watchdog.h"
 
 
 uint8_t txbuffer[3164], rxbuffer[3164];
@@ -83,10 +85,6 @@ static void cli_process_line(const String &line);
 static bool cli_process_json(const String &line);
 static bool cli_decode_base64(const String &src, std::string &out);
 static bool cli_encode_base64(const std::string &src, std::string &out);
-static bool diag_auth_is_valid(void);
-static bool diag_auth_attempt(const String &token);
-static void diag_auth_revoke(void);
-static bool diag_auth_required(void);
 
 const uint8_t MAX_SUPPORTED_SOUND_COUNT = 20;
 const uint8_t SLAC_MAX_RETRIES = 3;
@@ -735,35 +733,6 @@ void Timer20ms(void * parameter) {
 
 
 static String g_cli_buffer;
-static uint32_t g_diag_auth_until_ms = 0;
-
-static bool diag_auth_token_required() {
-    return (strlen(DIAG_AUTH_TOKEN) > 0);
-}
-
-static bool diag_auth_is_valid(void) {
-    if (!diag_auth_token_required()) return true;
-    if (g_diag_auth_until_ms == 0) return false;
-    return (int32_t)(millis() - (int32_t)g_diag_auth_until_ms) <= 0;
-}
-
-static bool diag_auth_attempt(const String &token) {
-    if (!diag_auth_token_required()) return true;
-    if (!token.length()) return false;
-    if (token.equals(DIAG_AUTH_TOKEN)) {
-        g_diag_auth_until_ms = millis() + DIAG_AUTH_WINDOW_MS;
-        return true;
-    }
-    return false;
-}
-
-static void diag_auth_revoke(void) {
-    g_diag_auth_until_ms = 0;
-}
-
-static bool diag_auth_required(void) {
-    return diag_auth_token_required();
-}
 
 static void split_tokens(const String &line, std::vector<String> &tokens) {
     int idx = 0;
@@ -821,7 +790,7 @@ static bool cli_process_json(const String &line) {
         };
         if (!strcmp(op, "auth")) {
             const char *token = doc["token"] | "";
-            if (diag_auth_attempt(String(token))) {
+            if (diag_auth_attempt(token, millis())) {
                 res["ok"] = true;
                 emit();
             } else {
@@ -841,7 +810,7 @@ static bool cli_process_json(const String &line) {
     }
     if (diag_auth_required()) {
         const char *token = doc["auth_token"] | "";
-        if (!diag_auth_attempt(String(token))) {
+        if (!diag_auth_attempt(token, millis())) {
             StaticJsonDocument<256> res;
             res["type"] = "pki.res";
             res["ok"] = false;
@@ -949,11 +918,11 @@ static void cli_process_line(const String &line) {
     }
     if (tokens[0].equalsIgnoreCase("diag")) {
         if (tokens.size() >= 3 && tokens[1].equalsIgnoreCase("auth")) {
-            if (diag_auth_attempt(tokens[2])) {
-                Serial.println("[DIAG] Auth accepted");
-            } else {
-                diag_auth_revoke();
-                Serial.println("[DIAG] Auth failed");
+        if (diag_auth_attempt(tokens[2].c_str(), millis())) {
+            Serial.println("[DIAG] Auth accepted");
+        } else {
+            diag_auth_revoke();
+            Serial.println("[DIAG] Auth failed");
             }
         } else {
             Serial.println("[DIAG] Usage: diag auth <token>");
@@ -964,7 +933,7 @@ static void cli_process_line(const String &line) {
         Serial.println("[CLI] Unknown command");
         return;
     }
-    if (diag_auth_required() && !diag_auth_is_valid()) {
+    if (diag_auth_required() && !diag_auth_is_valid(millis())) {
         Serial.println("[PKI] Authorization required (diag auth <token>)");
         return;
     }
@@ -1058,6 +1027,8 @@ void setup() {
 
     Serial.begin();
     Serial.printf("\npowerup\n");
+    diag_auth_init(DIAG_AUTH_TOKEN, DIAG_AUTH_WINDOW_MS);
+    iso_watchdog_configure(ISO_STATE_TIMEOUT_MS, ISO_STATE_WATCHDOG_MAX_RETRIES);
 
     // Create Task 20ms Timer
     xTaskCreate(

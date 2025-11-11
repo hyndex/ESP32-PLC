@@ -17,5 +17,6 @@ This backlog translates the high-level integration plan into concrete, traceable
 | HLC-03 | Integrate ISO-20 | Embed libiso15118 on ESP32 (`lib/libiso15118/` port + `src/iso15118_dc.cpp` wiring), feed callbacks from cp_control/dc_can, and keep ISO‑20 loop active via ControlEvent start/stop. *(TLS 1.3 hooks still TBD, but controller + cert drop are in place.)* | Firmware | ⚙ |
 | HAL-01 | Power HAL contract | Define/implement a consolidated EVSE power HAL consumed by DIN/ISO FSMs (contactors, DC setpoints, isolation). | Firmware/HW | ☐ |
 | PKI-01 | Certificate storage | Define storage + APIs for EVSE certificate/key + root CAs (NVS/secure element) plus CLI/JSON provisioning with diagnostic auth tokens. | Security | ☑ |
+| QA-01 | Embedded test suite | Extracted diag-auth + ISO watchdog logic into reusable modules and added PlatformIO Unity tests (ref. `temp/everest-core/modules/EVSE/EvseV2G/tests`) to stress auth expiry and watchdog fatal flows directly on ESP32. | Firmware | ☑ |
 
 _Legend_: ☐ = pending, ☑ = complete.
