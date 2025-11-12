@@ -31,10 +31,12 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#ifndef UNIT_TEST
 #include <ArduinoJson.h>
+#include <mbedtls/base64.h>
+#endif
 #include <vector>
 #include <string>
-#include <mbedtls/base64.h>
 #include <ctype.h>
 #include <string.h>
 
@@ -81,17 +83,20 @@ uint8_t EVCCID[6];  // Mac address or ID from the PEV, used in V2G communication
 uint8_t EVSOC = 0;  // State Of Charge of the EV, obtained from the 'ContractAuthenticationRequest' message
 
 static void cli_poll(void);
+#ifndef UNIT_TEST
 static void cli_process_line(const String &line);
 static bool cli_process_json(const String &line);
 static bool cli_decode_base64(const String &src, std::string &out);
 static bool cli_encode_base64(const std::string &src, std::string &out);
+#endif
 
 const uint8_t MAX_SUPPORTED_SOUND_COUNT = 20;
 const uint8_t SLAC_MAX_RETRIES = 3;
 const uint8_t ATTEN_CHAR_MAX_RETRIES = 3;
 const uint16_t ATTEN_CHAR_IND_FRAME_LEN = 130;
 const uint32_t ATTEN_CHAR_RESPONSE_TIMEOUT_MS = 500;
-const uint32_t SLAC_MATCH_TIMEOUT_MS = 1000;
+const uint32_t DEFAULT_SLAC_MATCH_TIMEOUT_MS = 2000;
+const uint32_t SLAC_MATCH_TIMEOUT_MARGIN_MS = 1000;
 const uint32_t MIN_SOUND_WINDOW_MS = 200;
 const uint32_t SOUND_TIMEOUT_UNIT_MS = 100;
 const uint16_t EXPECTED_MATCH_MVF_LEN = 0x003E;
@@ -101,9 +106,15 @@ uint8_t requestedSoundCount = 10;
 uint8_t negotiatedSoundCount = 10;
 uint8_t negotiatedSoundTimeoutField = 0x06;
 uint32_t currentSoundWindowMs = 600;
+uint32_t currentMatchWindowMs = DEFAULT_SLAC_MATCH_TIMEOUT_MS;
 uint8_t slacRetryCounter = 0;
 uint8_t attenCharRetryCounter = 0;
 uint8_t invalidFrameCounter = 0;
+bool pendingSessionKeyRotation = false;
+bool lastCpConnected = false;
+#ifdef UNIT_TEST
+static void (*g_slac_test_tx_hook)(const uint8_t *, uint32_t) = nullptr;
+#endif
 
 
 void SPI_InterruptHandler() { // Interrupt handler is currently unused
@@ -164,6 +175,12 @@ void qcaspi_write_register(uint16_t reg, uint16_t value) {
 }
 
 void qcaspi_write_burst(uint8_t *src, uint32_t len) {
+#ifdef UNIT_TEST
+    if (g_slac_test_tx_hook) {
+        g_slac_test_tx_hook(src, len);
+        return;
+    }
+#endif
     uint16_t total_len;
     uint8_t buf[10];
 
@@ -194,7 +211,7 @@ void qcaspi_write_burst(uint8_t *src, uint32_t len) {
 }
 
 uint32_t qcaspi_read_burst(uint8_t *dst) {
-    uint16_t available, rxbytes;
+    uint16_t available;
 
     available = qcaspi_read_register16(SPI_REG_RDBUF_BYTE_AVA);
 
@@ -247,7 +264,32 @@ void setACVarField(uint16_t offset, uint8_t samples) {
     for (uint8_t i=0; i<58; i++) {
         txbuffer[offset+i] = (uint8_t)(AvgACVar[i] / divisor);
     }
-}    
+}
+
+static uint32_t computeSoundWindowMs(uint8_t timeoutField) {
+    uint8_t effectiveField = timeoutField ? timeoutField : 0x06;
+    uint32_t window = (uint32_t)effectiveField * SOUND_TIMEOUT_UNIT_MS;
+    if (window < MIN_SOUND_WINDOW_MS) window = MIN_SOUND_WINDOW_MS;
+    return window;
+}
+
+static void refreshMatchWindowFromSound() {
+    uint32_t candidate = currentSoundWindowMs + SLAC_MATCH_TIMEOUT_MARGIN_MS;
+    if (candidate < DEFAULT_SLAC_MATCH_TIMEOUT_MS) candidate = DEFAULT_SLAC_MATCH_TIMEOUT_MS;
+    currentMatchWindowMs = candidate;
+}
+
+static void clearSlacMeasurements() {
+    ReceivedSounds = 0;
+    ReceivedProfiles = 0;
+    AttenCharResponseTimer = 0;
+    SlacMatchTimer = 0;
+    memset(AvgACVar, 0x00, sizeof(AvgACVar));
+}
+
+static void scheduleSessionKeyRotation() {
+    pendingSessionKeyRotation = true;
+}
 
 uint16_t getManagementMessageType() {
     // calculates the MMTYPE (base value + lower two bits), see Table 11-2 of homeplug spec
@@ -452,16 +494,14 @@ void handleSlacFailure(const char *reason) {
         slacRetryCounter++;
     }
     attenCharRetryCounter = 0;
-    ReceivedSounds = 0;
-    ReceivedProfiles = 0;
-    AttenCharResponseTimer = 0;
-    SlacMatchTimer = 0;
+    clearSlacMeasurements();
     modem_state = MODEM_CONFIGURED;
+    scheduleSessionKeyRotation();
 }
 
 // Received SLAC messages from the PEV are handled here
 void SlacManager(uint16_t rxbytes) {
-    uint16_t reg16, mnt, x;
+    uint16_t mnt, x;
 
     mnt = getManagementMessageType();
   
@@ -495,8 +535,8 @@ void SlacManager(uint16_t rxbytes) {
             negotiatedSoundCount = 10;
             negotiatedSoundTimeoutField = 0x06;
         }
-        currentSoundWindowMs = (uint32_t)negotiatedSoundTimeoutField * SOUND_TIMEOUT_UNIT_MS;
-        if (currentSoundWindowMs < MIN_SOUND_WINDOW_MS) currentSoundWindowMs = MIN_SOUND_WINDOW_MS;
+        currentSoundWindowMs = computeSoundWindowMs(negotiatedSoundTimeoutField);
+        refreshMatchWindowFromSound();
         slacRetryCounter = 0;
         attenCharRetryCounter = 0;
         ReceivedSounds = 0;
@@ -513,6 +553,25 @@ void SlacManager(uint16_t rxbytes) {
 
     } else if (mnt == (CM_START_ATTEN_CHAR + MMTYPE_IND) && modem_state == SLAC_PARAM_CNF) {
         Serial.printf("received CM_START_ATTEN_CHAR.IND\n");
+        bool updatedParameters = false;
+        if (rxbytes > 21 && rxbuffer[21] != 0x00) {
+            negotiatedSoundCount = rxbuffer[21];
+            if (negotiatedSoundCount == 0) negotiatedSoundCount = 1;
+            if (negotiatedSoundCount > MAX_SUPPORTED_SOUND_COUNT) negotiatedSoundCount = MAX_SUPPORTED_SOUND_COUNT;
+            updatedParameters = true;
+        }
+        if (rxbytes > 22 && rxbuffer[22] != 0x00) {
+            negotiatedSoundTimeoutField = rxbuffer[22];
+            updatedParameters = true;
+        }
+        currentSoundWindowMs = computeSoundWindowMs(negotiatedSoundTimeoutField);
+        refreshMatchWindowFromSound();
+        if (updatedParameters) {
+            Serial.printf("Updated sounding window to %lums (%u sounds), match window %lums\n",
+                          (unsigned long)currentSoundWindowMs,
+                          negotiatedSoundCount,
+                          (unsigned long)currentMatchWindowMs);
+        }
         SoundsTimer = millis(); // start timer
         memset(AvgACVar, 0x00, sizeof(AvgACVar)); // reset averages.
         ReceivedSounds = 0;
@@ -545,6 +604,7 @@ void SlacManager(uint16_t rxbytes) {
             Serial.printf("Successful SLAC process\n");
             modem_state = ATTEN_CHAR_RSP;
             SlacMatchTimer = millis();
+            refreshMatchWindowFromSound();
             attenCharRetryCounter = 0;
         } else {
             Serial.printf("ATTEN_CHAR.RSP validation failed (status=0x%02x)\n", rxbuffer[69]);
@@ -591,16 +651,24 @@ void SlacManager(uint16_t rxbytes) {
 //
 void Timer20ms(void * parameter) {
 
-    uint16_t reg16, rxbytes, mnt, x;
+    uint16_t reg16, rxbytes, x;
     uint16_t FrameType;
     
     while(1)  // infinite loop
     {
         cp_tick();
-        if (!cp_is_connected()) {
+        bool cpConnected = cp_is_connected();
+        if (!cpConnected) {
             if (cp_is_contactor_commanded()) cp_contactor_command(false);
             if (dc_is_enabled()) dc_enable_output(false);
         }
+        if (!cpConnected && lastCpConnected) {
+            Serial.printf("Control pilot opened, rearming SLAC session\n");
+            clearSlacMeasurements();
+            modem_state = MODEM_CONFIGURED;
+            scheduleSessionKeyRotation();
+        }
+        lastCpConnected = cpConnected;
         dc_can_tick();
         lwip_bridge_poll();
 
@@ -700,7 +768,7 @@ void Timer20ms(void * parameter) {
             }
         }
 
-        if (modem_state == ATTEN_CHAR_RSP && (SlacMatchTimer + SLAC_MATCH_TIMEOUT_MS) < millis()) {
+        if (modem_state == ATTEN_CHAR_RSP && (SlacMatchTimer + currentMatchWindowMs) < millis()) {
             handleSlacFailure("SLAC_MATCH timeout");
         }
 
@@ -723,6 +791,11 @@ void Timer20ms(void * parameter) {
         }
 
 
+        if (pendingSessionKeyRotation && modem_state == MODEM_CONFIGURED) {
+            pendingSessionKeyRotation = false;
+            modem_state = MODEM_CM_SET_KEY_REQ;
+        }
+
         tcp_tick();
 
         // Pause the task for 20ms
@@ -732,6 +805,7 @@ void Timer20ms(void * parameter) {
 }    
 
 
+#ifndef UNIT_TEST
 static String g_cli_buffer;
 
 static void split_tokens(const String &line, std::vector<String> &tokens) {
@@ -1008,6 +1082,47 @@ static void cli_poll(void) {
         }
     }
 }
+#endif // UNIT_TEST
+
+#ifdef UNIT_TEST
+extern "C" void slac_test_set_tx_hook(void (*hook)(const uint8_t *, uint32_t)) {
+    g_slac_test_tx_hook = hook;
+}
+
+extern "C" void slac_test_reset_state(void) {
+    memset(txbuffer, 0, sizeof(txbuffer));
+    memset(rxbuffer, 0, sizeof(rxbuffer));
+    memset(pevMac, 0, sizeof(pevMac));
+    memset(myModemMac, 0, sizeof(myModemMac));
+    memset(pevModemMac, 0, sizeof(pevModemMac));
+    memset(pevRunId, 0, sizeof(pevRunId));
+    memset(AvgACVar, 0, sizeof(AvgACVar));
+    memset(NMK, 0, sizeof(NMK));
+    uint8_t defaultNid[7] = {1, 2, 3, 4, 5, 6, 7};
+    memcpy(NID, defaultNid, sizeof(NID));
+    SoundsTimer = 0;
+    ModemSearchTimer = 0;
+    AttenCharResponseTimer = 0;
+    SlacMatchTimer = 0;
+    ModemsFound = 0;
+    ReceivedSounds = 0;
+    ReceivedProfiles = 0;
+    memset(EVCCID, 0, sizeof(EVCCID));
+    EVSOC = 0;
+    requestedSoundCount = 10;
+    negotiatedSoundCount = 10;
+    negotiatedSoundTimeoutField = 0x06;
+    currentSoundWindowMs = 600;
+    currentMatchWindowMs = DEFAULT_SLAC_MATCH_TIMEOUT_MS;
+    slacRetryCounter = 0;
+    attenCharRetryCounter = 0;
+    invalidFrameCounter = 0;
+    pendingSessionKeyRotation = false;
+    lastCpConnected = false;
+    modem_state = MODEM_CONFIGURED;
+    g_slac_test_tx_hook = nullptr;
+}
+#endif
 
 #ifndef APP_NO_MAIN
 void setup() {
@@ -1070,7 +1185,9 @@ void loop() {
   //  Serial.printf("Total PSRAM: %u\n", ESP.getPsramSize());
   //  Serial.printf("Free PSRAM: %u\n", ESP.getFreePsram());
 
+#ifndef UNIT_TEST
     cli_poll();
+#endif
     iso20_loop();
     delay(1000);
 }
@@ -1085,4 +1202,9 @@ extern "C" void app_main() {
     }
 }
 #endif
-#endif // UNIT_TEST
+
+#else
+extern "C" void app_main(void) {
+    // APP_NO_MAIN builds link against an external test harness; nothing to do here.
+}
+#endif // APP_NO_MAIN

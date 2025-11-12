@@ -170,4 +170,51 @@ Use it after any change to high-level state handling.
 
 ---
 
+## 🧪 Host-Side Log Replay (SLAC → DIN/HLC)
+
+To guarantee regressions are caught before hardware testing, we replay a golden log of a real CCS32berta charging session all the way from SLAC through DIN SessionStop. The host binary links the actual firmware sources plus `libcbv2g`, so the same state machines run, but packet IO is stubbed.
+
+### 1. Configure & Build
+
+```bash
+# Configure (fetches googletest + libcbv2g)
+cmake -S test/gtest_slac_flow -B build/test_slac_flow
+
+# Build the host test binary
+cmake --build build/test_slac_flow
+```
+
+Behind the scenes this pulls in:
+- `src/main.cpp`, `src/tcp.cpp`, `src/ipv6.cpp`, `src/iso_watchdog.cpp`, `src/diag_auth.cpp`
+- `lib/libcbv2g` (EXI encoder/decoder for DIN/ISO)
+- Test stubs for Arduino peripherals, CP, CAN, TLS, lwIP, etc.
+
+### 2. Run the Replay Suite
+
+```bash
+ctest --test-dir build/test_slac_flow --output-on-failure
+```
+
+Two gtests execute:
+
+| Test | Coverage | Pass Criteria |
+|------|----------|---------------|
+| `SlacFlowTest.ReplaysRecordedSequence` | Raw HomePlug SLAC (GET\_SW → CM\_SET\_KEY) | Every EVSE frame that CCS32berta transmitted during the log is reproduced bit-for-bit. Any byte mismatch pinpoints the step (e.g. SLAC\_MATCH). |
+| `DinEndToEndTest.ReplayDemoLogProducesRecordedResponses` | SDP + TCP + DIN 70121 (SAP → SessionStop) | The log’s UDP SDP exchange, TCP transport, and every DIN EXI payload are replayed against the firmware. We parse the recorded responses (`temp/ccs32berta/doc/2023-07-04_demoChargingWorks.log`) and assert the firmware emits identical bytes for every stage (ServiceDiscovery, CableCheck, PreCharge, PowerDelivery, CurrentDemand loop, SessionStop). |
+
+Passing this suite means a clean-room rebuild of the firmware, when driven with the captured EV traffic, produces the **exact same** EVSE behavior as the hardware run that generated the log. If any byte differs, the test output includes a SCOPED\_TRACE dump summarizing the decoded header/body (session IDs, EVSE status, physical values) to speed up debugging.
+
+### 3. Interpreting Failures
+
+| Symptom | Likely Cause | Next Steps |
+|---------|-------------|-----------|
+| SLAC test fails at frame N | MAC / NMK constants changed, timer regression, or DSP header encoding drift | Inspect `test/gtest_slac_flow/slac_flow_test.cpp` expected frame, compare to actual hex dump, adjust `src/main.cpp` composers. |
+| DIN replay fails early (SAP/SessionSetup) | Session ID / EVSEID changed or TLS flag mismatched | Ensure `evse_config.h` constants match the log, or regenerate the log/expected frames. |
+| DIN replay fails mid-flow (e.g. PowerDelivery, CurrentDemand) | Firmware started populating new optional fields or changed unit multipliers | Use the SCOPED\_TRACE output to compare decoded EVSE status and physical values, then update `src/tcp.cpp` encoders (or update expected log if change is intentional). |
+| Missing response for request X | Firmware dropped to a different state (watchdog reset, unexpected stop) | Reproduce with `--output-on-failure`, look at stdout logs in `build/test_slac_flow/Testing/Temporary/LastTest.log` to see which state machine path triggered. |
+
+Because the suite reuses the production EXI encoders and state machines, it is a reliable regression gate for all PLC/HLC behavior—even without a QCA modem or EV in the loop.
+
+---
+
 Happy charging! 🚗⚡

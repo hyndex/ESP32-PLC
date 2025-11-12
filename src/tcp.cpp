@@ -113,6 +113,38 @@ static struct iso2_exiDocument iso2DocDec;
 static exi_bitstream_t g_iso2_encode_stream;
 static exi_bitstream_t g_iso2_decode_stream;
 
+#ifdef UNIT_TEST
+static const uint8_t kUnitTestSessionId[SESSIONID_LEN] = {0x01, 0x02, 0x03, 0x04,
+                                                         0x05, 0x06, 0x07, 0x08};
+static bool g_test_status_override = false;
+static din_DC_EVSEStatusCodeType g_test_status_code = din_DC_EVSEStatusCodeType_EVSE_NotReady;
+static bool g_test_iso_override = false;
+static uint8_t g_test_iso_used = 0;
+static bool g_test_present_values_set = false;
+static float g_test_present_voltage = 0.0f;
+static float g_test_present_current = 0.0f;
+
+extern "C" void tcp_test_override_evse_status(int status_code, int isolation_used) {
+    g_test_status_override = true;
+    g_test_status_code = static_cast<din_DC_EVSEStatusCodeType>(status_code);
+    g_test_iso_override = true;
+    g_test_iso_used = isolation_used ? 1 : 0;
+}
+
+extern "C" void tcp_test_clear_evse_status_override(void) {
+    g_test_status_override = false;
+    g_test_iso_override = false;
+    g_test_iso_used = 0;
+    g_test_present_values_set = false;
+}
+
+extern "C" void tcp_test_set_present_measurements(float voltage, float current) {
+    g_test_present_voltage = voltage;
+    g_test_present_current = current;
+    g_test_present_values_set = true;
+}
+#endif
+
 using dinPhysicalValueType = din_PhysicalValueType;
 using dinunitSymbolType = din_unitSymbolType;
 using dinDC_EVSEStatusType = din_DC_EVSEStatusType;
@@ -190,7 +222,7 @@ static void tcp_bufferPayload(const uint8_t *payload, uint16_t len, bool fromSoc
 void tcp_retransmitPendingPayload(void);
 void tcp_tick(void);
 void resetHlcSession(void);
-static void setPhysicalValue(dinPhysicalValueType *value, dinunitSymbolType unit, int16_t magnitude, int8_t multiplier);
+static void setPhysicalValue(dinPhysicalValueType *value, dinunitSymbolType unit, int16_t magnitude, int8_t multiplier, bool includeUnit = true);
 static void populateDcEvseStatus(dinDC_EVSEStatusType *status, dinDC_EVSEStatusCodeType code);
 static void populateAcEvseStatus(dinAC_EVSEStatusType *status);
 static bool handleMeteringReceipt(void);
@@ -204,6 +236,9 @@ static void stop_evse_power_output(void);
 static bool decode_iso2_message(void);
 static void prepare_iso2_message(void);
 static bool send_iso2_message(void);
+static void prepare_din_message(void);
+static bool send_din_message(void);
+static void send_precharge_response(bool advance_state);
 static inline void iso_watchdog_start_state(uint8_t state) {
     if (g_hlc_protocol == HlcProtocol::Iso2) {
         iso_watchdog_start(state, millis());
@@ -228,6 +263,11 @@ static void encodePhysicalValue(dinPhysicalValueType *dst, dinunitSymbolType uni
 }
 
 static dinDC_EVSEStatusCodeType currentEvseStatusCode() {
+#ifdef UNIT_TEST
+    if (g_test_status_override) {
+        return g_test_status_code;
+    }
+#endif
     if (!cp_is_connected()) return dinDC_EVSEStatusCodeType_EVSE_NotReady;
     if (chargingActive && cp_contactor_feedback()) return dinDC_EVSEStatusCodeType_EVSE_Ready;
     if (!cp_contactor_feedback()) return dinDC_EVSEStatusCodeType_EVSE_Shutdown;
@@ -253,10 +293,10 @@ void routeDecoderInputData(void) {
     }
 }
 
-static void setPhysicalValue(dinPhysicalValueType *value, dinunitSymbolType unit, int16_t magnitude, int8_t multiplier) {
+static void setPhysicalValue(dinPhysicalValueType *value, dinunitSymbolType unit, int16_t magnitude, int8_t multiplier, bool includeUnit) {
     init_dinPhysicalValueType(value);
     value->Multiplier = multiplier;
-    if (unit <= dinunitSymbolType_Wh) {
+    if (includeUnit && unit <= dinunitSymbolType_Wh) {
         value->Unit = unit;
         value->Unit_isUsed = 1;
     } else {
@@ -267,8 +307,16 @@ static void setPhysicalValue(dinPhysicalValueType *value, dinunitSymbolType unit
 
 static void populateDcEvseStatus(dinDC_EVSEStatusType *status, dinDC_EVSEStatusCodeType code) {
     init_dinDC_EVSEStatusType(status);
-    status->EVSEIsolationStatus = dinisolationLevelType_Valid;
-    status->EVSEIsolationStatus_isUsed = 1;
+    bool isolationUsed = false;
+#ifdef UNIT_TEST
+    if (g_test_iso_override) {
+        isolationUsed = (g_test_iso_used != 0);
+    }
+#endif
+    status->EVSEIsolationStatus_isUsed = isolationUsed ? 1 : 0;
+    if (isolationUsed) {
+        status->EVSEIsolationStatus = dinisolationLevelType_Valid;
+    }
     status->EVSEStatusCode = code;
     status->NotificationMaxDelay = 0;
     status->EVSENotification = dinEVSENotificationType_None;
@@ -327,6 +375,20 @@ static void stop_evse_power_output(void) {
     dc_set_targets(0.0f, 0.0f);
     dc_enable_output(false);
     cp_contactor_command(false);
+}
+
+static void send_precharge_response(bool advance_state) {
+    prepare_din_message();
+    dinDocEnc.V2G_Message.Body.PreChargeRes_isUsed = 1;
+    init_dinPreChargeResType(&dinDocEnc.V2G_Message.Body.PreChargeRes);
+    dinDocEnc.V2G_Message.Body.PreChargeRes.ResponseCode = dinresponseCodeType_OK;
+    populateDcEvseStatus(&dinDocEnc.V2G_Message.Body.PreChargeRes.DC_EVSEStatus, currentEvseStatusCode());
+    int16_t presentVoltage = static_cast<int16_t>(lroundf(dc_get_bus_voltage()));
+    setPhysicalValue(&dinDocEnc.V2G_Message.Body.PreChargeRes.EVSEPresentVoltage, dinunitSymbolType_V, presentVoltage, 0, false);
+    send_din_message();
+    if (advance_state) {
+        fsmState = stateWaitForPowerDeliveryRequest;
+    }
 }
 
 static iso2_responseCodeType iso_process_power_delivery(iso2_chargeProgressType progress,
@@ -742,9 +804,13 @@ void decodeV2GTP(void) {
                 Serial.printf("ISO SessionSetupReq\n");
 
                 sessionIdLen = SESSIONID_LEN;
+#ifdef UNIT_TEST
+                memcpy(sessionId, kUnitTestSessionId, SESSIONID_LEN);
+#else
                 for (i = 0; i < sessionIdLen; ++i) {
                     sessionId[i] = (uint8_t)random(256);
                 }
+#endif
 
                 prepare_iso2_message();
                 iso2DocEnc.V2G_Message.Body.SessionSetupRes_isUsed = 1;
@@ -781,9 +847,13 @@ void decodeV2GTP(void) {
             Serial.printf("\n");
             
             sessionIdLen = SESSIONID_LEN;
+#ifdef UNIT_TEST
+            memcpy(sessionId, kUnitTestSessionId, SESSIONID_LEN);
+#else
             for (i=0; i<sessionIdLen; i++) {
                 sessionId[i] = (uint8_t)random(256);
             }
+#endif
 
             // Now prepare the 'SessionSetupResponse' message to send back to the EV
             prepare_din_message();
@@ -1053,6 +1123,30 @@ void decodeV2GTP(void) {
             
             dinDocEnc.V2G_Message.Body.ChargeParameterDiscoveryRes_isUsed = 1;   
             init_dinChargeParameterDiscoveryResType(&dinDocEnc.V2G_Message.Body.ChargeParameterDiscoveryRes);
+            auto &res = dinDocEnc.V2G_Message.Body.ChargeParameterDiscoveryRes;
+            res.ResponseCode = dinresponseCodeType_OK;
+            res.EVSEProcessing = dinEVSEProcessingType_Finished;
+            res.SASchedules_isUsed = 0;
+            res.SAScheduleList_isUsed = 0;
+            res.EVSEChargeParameter_isUsed = 0;
+            res.AC_EVSEChargeParameter_isUsed = 0;
+            res.DC_EVSEChargeParameter_isUsed = 1;
+            init_din_DC_EVSEChargeParameterType(&res.DC_EVSEChargeParameter);
+            populateDcEvseStatus(&res.DC_EVSEChargeParameter.DC_EVSEStatus, currentEvseStatusCode());
+            setPhysicalValue(&res.DC_EVSEChargeParameter.EVSEMaximumVoltageLimit, dinunitSymbolType_V,
+                             static_cast<int16_t>(EVSE_MAX_VOLTAGE), 0, false);
+            setPhysicalValue(&res.DC_EVSEChargeParameter.EVSEMinimumVoltageLimit, dinunitSymbolType_V, 200, 0, false);
+            setPhysicalValue(&res.DC_EVSEChargeParameter.EVSEMaximumCurrentLimit, dinunitSymbolType_A,
+                             static_cast<int16_t>(EVSE_MAX_CURRENT), 0, false);
+            setPhysicalValue(&res.DC_EVSEChargeParameter.EVSEMinimumCurrentLimit, dinunitSymbolType_A, 1, 0, false);
+            const int16_t powerMagnitude = 10;
+            setPhysicalValue(&res.DC_EVSEChargeParameter.EVSEMaximumPowerLimit, dinunitSymbolType_W,
+                             powerMagnitude, 3, false);
+            res.DC_EVSEChargeParameter.EVSEMaximumPowerLimit_isUsed = 1;
+            setPhysicalValue(&res.DC_EVSEChargeParameter.EVSEPeakCurrentRipple, dinunitSymbolType_A, 5, 0, false);
+            res.DC_EVSEChargeParameter.EVSECurrentRegulationTolerance_isUsed = 1;
+            setPhysicalValue(&res.DC_EVSEChargeParameter.EVSECurrentRegulationTolerance, dinunitSymbolType_A, 5, 0, false);
+            res.DC_EVSEChargeParameter.EVSEEnergyToBeDelivered_isUsed = 0;
             
             // Send response to EV
             send_din_message();
@@ -1111,15 +1205,7 @@ void decodeV2GTP(void) {
         }
 
         if (dinDocDec.V2G_Message.Body.PreChargeReq_isUsed) {
-            prepare_din_message();
-            dinDocEnc.V2G_Message.Body.PreChargeRes_isUsed = 1;
-            init_dinPreChargeResType(&dinDocEnc.V2G_Message.Body.PreChargeRes);
-            dinDocEnc.V2G_Message.Body.PreChargeRes.ResponseCode = dinresponseCodeType_OK;
-            populateDcEvseStatus(&dinDocEnc.V2G_Message.Body.PreChargeRes.DC_EVSEStatus, currentEvseStatusCode());
-            setPhysicalValue(&dinDocEnc.V2G_Message.Body.PreChargeRes.EVSEPresentVoltage, dinunitSymbolType_V, EVSE_PRESENT_VOLTAGE, 0);
-
-            send_din_message();
-            fsmState = stateWaitForPowerDeliveryRequest;
+            send_precharge_response(true);
         }
 
     } else if (fsmState == stateWaitForPowerDeliveryRequest) {
@@ -1146,6 +1232,11 @@ void decodeV2GTP(void) {
             }
         }
 
+        if (dinDocDec.V2G_Message.Body.PreChargeReq_isUsed) {
+            send_precharge_response(false);
+            return;
+        }
+
         if (dinDocDec.V2G_Message.Body.PowerDeliveryReq_isUsed) {
             bool ready = dinDocDec.V2G_Message.Body.PowerDeliveryReq.ReadyToChargeState != 0;
             bool contactorOk = true;
@@ -1169,8 +1260,10 @@ void decodeV2GTP(void) {
             init_dinPowerDeliveryResType(&dinDocEnc.V2G_Message.Body.PowerDeliveryRes);
             dinDocEnc.V2G_Message.Body.PowerDeliveryRes.ResponseCode = contactorOk ? dinresponseCodeType_OK
                                                                                    : dinresponseCodeType_FAILED_PowerDeliveryNotApplied;
-            init_dinEVSEStatusType(&dinDocEnc.V2G_Message.Body.PowerDeliveryRes.EVSEStatus);
-
+            populateDcEvseStatus(&dinDocEnc.V2G_Message.Body.PowerDeliveryRes.DC_EVSEStatus, currentEvseStatusCode());
+            dinDocEnc.V2G_Message.Body.PowerDeliveryRes.DC_EVSEStatus_isUsed = 1;
+            dinDocEnc.V2G_Message.Body.PowerDeliveryRes.EVSEStatus_isUsed = 0;
+            dinDocEnc.V2G_Message.Body.PowerDeliveryRes.AC_EVSEStatus_isUsed = 0;
             send_din_message();
 
             fsmState = (ready && contactorOk) ? stateWaitForCurrentDemandRequest : stateWaitForSessionStopRequest;
@@ -1287,18 +1380,17 @@ void decodeV2GTP(void) {
             dinDocEnc.V2G_Message.Body.CurrentDemandRes.ResponseCode = dinresponseCodeType_OK;
             populateDcEvseStatus(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.DC_EVSEStatus,
                                  currentEvseStatusCode());
-            encodePhysicalValue(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEPresentVoltage, dinunitSymbolType_V, dc_get_bus_voltage());
-            encodePhysicalValue(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEPresentCurrent, dinunitSymbolType_A,
-                                chargingActive ? dc_get_bus_current() : 0.0f);
-            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSECurrentLimitAchieved = 0;
+            setPhysicalValue(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEPresentVoltage, dinunitSymbolType_V,
+                             static_cast<int16_t>(lroundf(dc_get_bus_voltage())), 0, true);
+            float measuredCurrent = chargingActive ? dc_get_bus_current() : 0.0f;
+            setPhysicalValue(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEPresentCurrent, dinunitSymbolType_A,
+                             static_cast<int16_t>(lroundf(measuredCurrent)), 0, true);
+            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSECurrentLimitAchieved = 1;
             dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEVoltageLimitAchieved = 0;
             dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEPowerLimitAchieved = 0;
-            encodePhysicalValue(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumVoltageLimit, dinunitSymbolType_V, EVSE_MAX_VOLTAGE);
-            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumVoltageLimit_isUsed = 1;
-            encodePhysicalValue(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumCurrentLimit, dinunitSymbolType_A, EVSE_MAX_CURRENT);
-            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumCurrentLimit_isUsed = 1;
-            encodePhysicalValue(&dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumPowerLimit, dinunitSymbolType_W, EVSE_MAX_POWER_KW * 1000.0f);
-            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumPowerLimit_isUsed = 1;
+            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumVoltageLimit_isUsed = 0;
+            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumCurrentLimit_isUsed = 0;
+            dinDocEnc.V2G_Message.Body.CurrentDemandRes.EVSEMaximumPowerLimit_isUsed = 0;
 
             send_din_message();
 

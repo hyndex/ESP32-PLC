@@ -92,6 +92,13 @@
 #define EVSE_SERVICE_NAME "DC Charging"
 #endif
 
+#ifdef UNIT_TEST
+#undef EVSE_ID
+#define EVSE_ID "ZZ00000"
+#undef EVSE_MAX_VOLTAGE
+#define EVSE_MAX_VOLTAGE 450
+#endif
+
 // === CAN / Maxwell module configuration ===
 #ifndef CAN_CS_PIN
 #define CAN_CS_PIN 13

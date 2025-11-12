@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <string.h>
 #include "main.h"
 #include "tcp.h"
 #include "evse_config.h"
