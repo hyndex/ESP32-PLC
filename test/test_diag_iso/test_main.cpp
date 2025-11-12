@@ -71,3 +71,14 @@ void setup() {
 
 void loop() {
 }
+
+#ifdef ESP_PLATFORM
+extern "C" void app_main() {
+    initArduino();
+    setup();
+    while (true) {
+        loop();
+        vTaskDelay(1);
+    }
+}
+#endif

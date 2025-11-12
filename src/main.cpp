@@ -1009,6 +1009,7 @@ static void cli_poll(void) {
     }
 }
 
+#ifndef APP_NO_MAIN
 void setup() {
 
     pinMode(PIN_QCA700X_CS, OUTPUT);           // SPI_CS QCA7005 
@@ -1084,3 +1085,4 @@ extern "C" void app_main() {
     }
 }
 #endif
+#endif // UNIT_TEST
