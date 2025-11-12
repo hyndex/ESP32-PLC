@@ -37,6 +37,19 @@ It speaks HomePlug GreenPHY via a QCA7005 modem, runs lwIP + esp‑tls, executes
 ╚════════════════════════════════════════════════════════════════════╝
 ```
 
+### QCA7005 ↔ ESP32‑S3 Pinout
+
+| Signal | ESP32‑S3 GPIO | Notes |
+|--------|---------------|-------|
+| `SS / CS` | `GPIO41` | `PIN_QCA700X_CS` |
+| `SCK` | `GPIO48` | `SPI_SCK` |
+| `MOSI` | `GPIO47` | `SPI_MOSI` |
+| `MISO` | `GPIO21` | `SPI_MISO` |
+| `IRQ` | `GPIO3`  | `PIN_QCA700X_INT` (rising edge) |
+| `RST` | `GPIO40` | `PIN_QCA700X_RST` (optional modem reset) |
+
+The pin macros live in `include/main.h`; adjust there if you spin a custom carrier.
+
 ---
 
 ## ✅ Feature Matrix

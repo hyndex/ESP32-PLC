@@ -1,9 +1,10 @@
 // Pin definitions
-#define PIN_QCA700X_INT 9             // SPI connections to QCA7000X
-#define PIN_QCA700X_CS 34
-#define SPI_MOSI 35
-#define SPI_MISO 37
-#define SPI_SCK 36
+#define PIN_QCA700X_INT 3             // IRQ from QCA7005
+#define PIN_QCA700X_CS 41             // SS / CS
+#define PIN_QCA700X_RST 40            // Optional modem reset (active high)
+#define SPI_MOSI 47
+#define SPI_MISO 21
+#define SPI_SCK 48
 
 /*====================================================================*
  *   SPI registers QCA700X
